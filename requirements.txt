@@ -5,5 +5,5 @@ asyncpg
 python-dotenv
 pandas
 numpy
+aiohttp
 websockets
-apscheduler

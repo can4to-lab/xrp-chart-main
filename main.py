@@ -3,7 +3,6 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import uvicorn
-import ccxt.async_support as ccxt
 import os
 
 # Yazdığımız kendi modüllerimizi (Sistem Organlarını) İçe Aktarıyoruz
@@ -48,7 +47,7 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
             contracts = float(pos.get('contracts', 0.0)
                               or pos.get('positionAmt', 0.0) or 0.0)
             if abs(contracts) > 0.0:
-                # DÜZELTİLEN SATIR: "XRP/USDT:USDT" -> "XRPUSDT" dönüşümü yapılır
+                # "XRP/USDT:USDT" -> "XRPUSDT" dönüşümü (DB formatı)
                 sym = pos['symbol'].split(':')[0].replace('/', '')
 
                 pos_side = 'LONG' if contracts > 0 else 'SHORT'
@@ -70,14 +69,17 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
 
         # 3. Durum A & C Kontrolü: DB'de açık olanların borsadaki karşılıklarını denetle
         for db_trade in db_open_trades:
-            symbol = db_trade['symbol']
+            symbol = db_trade['symbol']  # DB formatı: "XRPUSDT"
+            # CCXT formatı: "XRP/USDT"
+            sym_ccxt = symbol.replace('USDT', '/USDT', 1) if 'USDT' in symbol else symbol
+
             if symbol not in binance_positions:
                 # Durum A: DB'de açık görünüyor ama Binance'te kapanmış (Örn: Stop Loss tetiklenmiş)
                 logger.warning(
                     f"[{symbol}] ⚠️ Tespit: İşlem DB'de AÇIK ama borsada pozisyon YOK! Kapatılıyor...")
 
-                # Kapanış fiyatı olarak son fiyatı çekelim
-                ticker = await client.exchange.fetch_ticker(symbol)
+                # Kapanış fiyatı olarak son fiyatı çekelim (CCXT formatında)
+                ticker = await client.exchange.fetch_ticker(sym_ccxt)
                 last_price = float(ticker.get('last', 0.0))
 
                 # PnL hesaplama
@@ -119,21 +121,24 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
         # 4. Durum B Kontrolü: Borsada açık ama DB'de kaydı olmayan kaçak pozisyonları kapat (Emergency Close)
         for symbol, bin_pos in binance_positions.items():
             if symbol not in db_open_dict:
+                # CCXT formatına çevir
+                sym_ccxt = symbol.replace('USDT', '/USDT', 1) if 'USDT' in symbol else symbol
+
                 logger.critical(
                     f"[{symbol}] 🔥 ACİL DURUM: Borsada açık pozisyon var ama veritabanında KAYDI YOK! Güvenlik için pozisyon acilen kapatılıyor...")
 
                 close_side = 'sell' if bin_pos['side'] == 'LONG' else 'buy'
                 formatted_size = float(
-                    client.exchange.amount_to_precision(symbol, bin_pos['size']))
+                    client.exchange.amount_to_precision(sym_ccxt, bin_pos['size']))
 
-                # Pozisyonu borsada acil kapat
+                # Pozisyonu borsada acil kapat (CCXT formatında)
                 await client.exchange.create_order(
-                    symbol=symbol, type='market', side=close_side, amount=formatted_size,
+                    symbol=sym_ccxt, type='market', side=close_side, amount=formatted_size,
                     params={'reduceOnly': True}
                 )
 
-                # Bekleyen tüm emirleri iptal et
-                await client.exchange.cancel_all_orders(symbol)
+                # Bekleyen tüm emirleri iptal et (CCXT formatında)
+                await client.exchange.cancel_all_orders(sym_ccxt)
 
                 await notifier.send_message(
                     f"🚨 <b>ACİL DURUM MUTABAKATI (EMERGENCY CLOSE)</b>\n\n"

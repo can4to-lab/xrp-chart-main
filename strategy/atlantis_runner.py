@@ -26,6 +26,7 @@ class TradeState:
                 'entry_price': 0.0,
                 'size': 0.0,
                 'tp_taken': False,  # %50 kâr alındı bayrağı
+                'strategy_type': None,  # Kullanılan strateji türü
             }
         return self._state[symbol]
 
@@ -37,6 +38,7 @@ class TradeState:
             'entry_price': 0.0,
             'size': 0.0,
             'tp_taken': False,
+            'strategy_type': None,
         }
 
     def set_tp_taken(self, symbol: str):
@@ -49,7 +51,10 @@ class AtlantisStrategyRunner:
     """Tam otonom Atlantis tarayıcısı: Çift işlem korumalı ve Çıkış kontrollü."""
 
     def __init__(self, symbols: List[str], execution_engine, risk_manager, client, timeframe: str = '5m'):
-        self.symbols = [s.replace("/", "").lower() for s in symbols]
+        # Orijinal sembol formatını (örn. "XRP/USDT") koru - CCXT bu formatta bekler
+        self.symbols = symbols  # Orijinal haliyle sakla
+        # Lock/state anahtarı için normalize edilmiş versiyon (örn. "XRPUSDT")
+        self.symbol_keys = [s.replace("/", "").upper() for s in symbols]
         self.execution_engine = execution_engine
         self.risk_manager = risk_manager
         self.client = client
@@ -60,14 +65,16 @@ class AtlantisStrategyRunner:
         logger.info("🛠️ Atlantis İndikatör Matematiği ve Durum Hafızası belleğe yüklendi.")
 
     async def _scan_market_for_symbol(self, symbol: str):
-        sym_upper = symbol.upper()
-        lock = state.get_symbol_lock(sym_upper) # Sembole özel kilit alınıyor
-        logger.info(f"[{sym_upper}] 🔍 {self.timeframe} periyotlu piyasa taraması başlatıldı.")
+        # CCXT için orijinal format (örn. "XRP/USDT"), lock/state için normalize (örn. "XRPUSDT")
+        sym_ccxt = symbol  # CCXT "XRP/USDT" formatını bekler
+        sym_key = symbol.replace("/", "").upper()  # Lock/state anahtarı
+        lock = state.get_symbol_lock(sym_key) # Sembole özel kilit alınıyor
+        logger.info(f"[{sym_key}] 🔍 {self.timeframe} periyotlu piyasa taraması başlatıldı.")
 
         while self._running:
             try:
                 # 1. Veri Çekme Aşaması (Lock Dışında - API istekleri kilidi bloklamasın)
-                ohlcv = await self.client.exchange.fetch_ohlcv(sym_upper, timeframe=self.timeframe, limit=200)
+                ohlcv = await self.client.exchange.fetch_ohlcv(sym_ccxt, timeframe=self.timeframe, limit=200)
 
                 if not ohlcv or len(ohlcv) < 150:
                     await asyncio.sleep(5)
@@ -79,8 +86,9 @@ class AtlantisStrategyRunner:
                 last_closed_candle = df_signals.iloc[-2]
                 current_price = df_signals.iloc[-1]['close']
 
-                is_3_green = bool(last_closed_candle['is_3_green'])
-                is_3_red = bool(last_closed_candle['is_3_red'])
+                # Yeni rejim değişimli sinyaller
+                regime = str(last_closed_candle.get('regime', 'UNKNOWN'))
+                strategy_type = str(last_closed_candle.get('strategy_type', 'NONE'))
                 long_signal = bool(last_closed_candle['long_signal'])
                 short_signal = bool(last_closed_candle['short_signal'])
                 long_exit = bool(last_closed_candle['long_exit'])
@@ -88,6 +96,10 @@ class AtlantisStrategyRunner:
                 long_tp_signal = bool(last_closed_candle['long_tp_signal'])
                 short_tp_signal = bool(last_closed_candle['short_tp_signal'])
                 atr_stop_dist = float(last_closed_candle['atr_stop_dist'])
+                
+                # Geriye dönük uyumluluk (eski TBO sinyalleri)
+                is_3_green = bool(last_closed_candle.get('is_3_green', False))
+                is_3_red = bool(last_closed_candle.get('is_3_red', False))
 
                 # --- 🔍 DETAYLI TREND ANALİZİ ---
                 # Hareketli ortalama değerlerini alıyoruz
@@ -108,8 +120,8 @@ class AtlantisStrategyRunner:
 
                 # 3. Kritik Karar ve İşlem Bölgesi (LOCK İÇİNDE - Çift İşlem / Yarış Durumu Koruması)
                 async with lock:
-                    open_trade = await db.get_open_trade(sym_upper)
-                    current_state = self.trade_state.get_state(sym_upper)
+                    open_trade = await db.get_open_trade(sym_key)
+                    current_state = self.trade_state.get_state(sym_key)
 
                     # DB'deki açık işlem ile state senkronizasyonu
                     if open_trade and not current_state['in_position']:
@@ -118,37 +130,62 @@ class AtlantisStrategyRunner:
                         current_state['entry_price'] = open_trade['entry_price']
                         current_state['size'] = open_trade['size']
                     elif not open_trade and current_state['in_position']:
-                        self.trade_state.reset_for_new_trade(sym_upper)
+                        self.trade_state.reset_for_new_trade(sym_key)
 
+                    # Rejim ve strateji ikonları
+                    rejim_ikonu = {"RANGE": "↔️", "SQUEEZE": "🎯", "TREND": "📈"}.get(regime, "❓")
+                    strateji_ikonu = {
+                        "MEAN_REVERSION": "🔄",
+                        "SQUEEZE": "💥",
+                        "TREND": "🚀",
+                        "LIQUIDITY_SWEEP": "🎣"
+                    }.get(strategy_type, "❓")
+                    
                     durum_ikonu = "🟢" if is_3_green else ("🔴" if is_3_red else "⚪")
                     pozisyon_durumu = f"İÇERİDEYİZ: {current_state['side']}" if current_state['in_position'] else "NAKİTTE BEKLENİYOR"
                     tp_durumu = " (TP ALINDI ✅)" if current_state['tp_taken'] else ""
+                    strateji_durumu = f" [{strategy_type}]" if current_state['strategy_type'] else ""
                     
                     # Detaylandırılmış Log Çıktısı
                     logger.info(
-                        f"[{sym_upper}] {durum_ikonu} Fiyat: {current_price:.4f} | {pozisyon_durumu}{tp_durumu}\n"
+                        f"[{sym_key}] {rejim_ikonu} {regime} | {strateji_ikonu} Fiyat: {current_price:.4f} | {pozisyon_durumu}{tp_durumu}{strateji_durumu}\n"
                         f"          └─ 📈 LONG Uyum : [F>M:{l1}] [M>MF:{l2}] [MF>S:{l3}]\n"
                         f"          └─ 📉 SHORT Uyum: [F<M:{s1}] [M<MF:{s2}] [MF<S:{s3}]"
                     )
   
                     # --- 1. HAYATTA KAL (ÇIKIŞ SİNYALİ KONTROLÜ) ---
                     if current_state['in_position']:
-                        # Ana çıkış: TBO 3'lü uyum bozulduğunda kalan pozisyonu kapat
+                        # Stratejiye özel çıkış sinyali
+                        exit_reason = None
                         if long_exit and current_state['side'] == 'LONG':
-                            logger.warning(f"[{sym_upper}] ⚠️ LONG ÇIKIŞ SİNYALİ! (3 Yeşil Bozuldu). Kalan pozisyon kapatılıyor...")
-                            await self.execution_engine.close_position(
-                                symbol=sym_upper, side='LONG', size=current_state['size'], reason="LONG EXIT SİNYALİ (TBO Bozuldu)"
-                            )
-                            self.trade_state.reset_for_new_trade(sym_upper)
-                            await asyncio.sleep(10)
-                            continue
-                            
+                            if current_state['strategy_type'] == 'MEAN_REVERSION':
+                                exit_reason = "LONG EXIT (Bollinger Orta Bandı)"
+                            elif current_state['strategy_type'] == 'SQUEEZE':
+                                exit_reason = "LONG EXIT (Squeeze Bitti)"
+                            elif current_state['strategy_type'] == 'TREND':
+                                exit_reason = "LONG EXIT (DI Kesişimi)"
+                            else:
+                                exit_reason = "LONG EXIT SİNYALİ"
+                                
                         elif short_exit and current_state['side'] == 'SHORT':
-                            logger.warning(f"[{sym_upper}] ⚠️ SHORT ÇIKIŞ SİNYALİ! (3 Kırmızı Bozuldu). Kalan pozisyon kapatılıyor...")
+                            if current_state['strategy_type'] == 'MEAN_REVERSION':
+                                exit_reason = "SHORT EXIT (Bollinger Orta Bandı)"
+                            elif current_state['strategy_type'] == 'SQUEEZE':
+                                exit_reason = "SHORT EXIT (Squeeze Bitti)"
+                            elif current_state['strategy_type'] == 'TREND':
+                                exit_reason = "SHORT EXIT (DI Kesişimi)"
+                            else:
+                                exit_reason = "SHORT EXIT SİNYALİ"
+                        
+                        if exit_reason:
+                            logger.warning(f"[{sym_key}] ⚠️ {exit_reason}! Kalan pozisyon kapatılıyor...")
                             await self.execution_engine.close_position(
-                                symbol=sym_upper, side='SHORT', size=current_state['size'], reason="SHORT EXIT SİNYALİ (TBO Bozuldu)"
+                                symbol=sym_key, 
+                                side=current_state['side'], 
+                                size=current_state['size'], 
+                                reason=exit_reason
                             )
-                            self.trade_state.reset_for_new_trade(sym_upper)
+                            self.trade_state.reset_for_new_trade(sym_key)
                             await asyncio.sleep(10)
                             continue
 
@@ -156,36 +193,36 @@ class AtlantisStrategyRunner:
                         # Sadece daha önce TP alınmamışsa ve hala pozisyondaysak
                         if not current_state['tp_taken']:
                             if long_tp_signal and current_state['side'] == 'LONG':
-                                logger.warning(f"[{sym_upper}] 💰 LONG TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
+                                logger.warning(f"[{sym_key}] 💰 LONG TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
                                 # Pozisyonun yarısını sat
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_upper, side='LONG', size=half_size, reason="LONG TP (Trend Yoruldu)"
+                                    symbol=sym_key, side='LONG', size=half_size, reason="LONG TP (Trend Yoruldu)"
                                 )
                                 # Stop loss'u break-even'a çek
                                 await self.execution_engine.move_stop_to_breakeven(
-                                    symbol=sym_upper, side='LONG', entry_price=current_state['entry_price']
+                                    symbol=sym_key, side='LONG', entry_price=current_state['entry_price']
                                 )
                                 # TP bayrağını işaretle
-                                self.trade_state.set_tp_taken(sym_upper)
+                                self.trade_state.set_tp_taken(sym_key)
                                 # State'deki boyutu güncelle (kalan %50)
                                 current_state['size'] = half_size
                                 await asyncio.sleep(10)
                                 continue
                                 
                             elif short_tp_signal and current_state['side'] == 'SHORT':
-                                logger.warning(f"[{sym_upper}] 💰 SHORT TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
+                                logger.warning(f"[{sym_key}] 💰 SHORT TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
                                 # Pozisyonun yarısını sat
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_upper, side='SHORT', size=half_size, reason="SHORT TP (Trend Yoruldu)"
+                                    symbol=sym_key, side='SHORT', size=half_size, reason="SHORT TP (Trend Yoruldu)"
                                 )
                                 # Stop loss'u break-even'a çek
                                 await self.execution_engine.move_stop_to_breakeven(
-                                    symbol=sym_upper, side='SHORT', entry_price=current_state['entry_price']
+                                    symbol=sym_key, side='SHORT', entry_price=current_state['entry_price']
                                 )
                                 # TP bayrağını işaretle
-                                self.trade_state.set_tp_taken(sym_upper)
+                                self.trade_state.set_tp_taken(sym_key)
                                 # State'deki boyutu güncelle (kalan %50)
                                 current_state['size'] = half_size
                                 await asyncio.sleep(10)
@@ -197,13 +234,14 @@ class AtlantisStrategyRunner:
 
                     # --- 3. FIRSAT ARA (GİRİŞ SİNYALİ KONTROLÜ) ---
                     if long_signal:
-                        logger.info(f"[{sym_upper}] 🚀 GÜÇLÜ LONG SİNYALİ! İşleme giriliyor...")
-                        margin_usdt = await self.risk_manager.calculate_margin(sym_upper)
+                        strateji_adi = strategy_type if strategy_type != 'NONE' else 'UNKNOWN'
+                        logger.info(f"[{sym_key}] 🚀 GÜÇLÜ LONG SİNYALİ! ({regime} | {strategy_type}) İşleme giriliyor...")
+                        margin_usdt = await self.risk_manager.calculate_margin(sym_key)
                         
                         if margin_usdt > 0:
                             stop_price = current_price - atr_stop_dist
                             success = await self.execution_engine.execute_trade(
-                                symbol=sym_upper, side="LONG", margin_usdt=margin_usdt, 
+                                symbol=sym_key, side="LONG", margin_usdt=margin_usdt, 
                                 leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price
                             )
                             if success:
@@ -211,22 +249,24 @@ class AtlantisStrategyRunner:
                                 current_state['in_position'] = True
                                 current_state['side'] = 'LONG'
                                 current_state['entry_price'] = current_price
+                                current_state['strategy_type'] = strategy_type
                                 # Gerçek boyutu DB'den çek (senkronizasyon)
                                 await asyncio.sleep(0.5)  # DB kaydının tamamlanması için kısa bekle
-                                updated_trade = await db.get_open_trade(sym_upper)
+                                updated_trade = await db.get_open_trade(sym_key)
                                 if updated_trade:
                                     current_state['size'] = updated_trade['size']
-                                    logger.info(f"[{sym_upper}] State boyut güncellendi: {current_state['size']}")
+                                    logger.info(f"[{sym_key}] State boyut güncellendi: {current_state['size']} | Strateji: {strategy_type}")
                             await asyncio.sleep(10)
                             
                     elif short_signal:
-                        logger.info(f"[{sym_upper}] 🩸 GÜÇLÜ SHORT SİNYALİ! İşleme giriliyor...")
-                        margin_usdt = await self.risk_manager.calculate_margin(sym_upper)
+                        strateji_adi = strategy_type if strategy_type != 'NONE' else 'UNKNOWN'
+                        logger.info(f"[{sym_key}] 🩸 GÜÇLÜ SHORT SİNYALİ! ({regime} | {strategy_type}) İşleme giriliyor...")
+                        margin_usdt = await self.risk_manager.calculate_margin(sym_key)
                         
                         if margin_usdt > 0:
                             stop_price = current_price + atr_stop_dist
                             success = await self.execution_engine.execute_trade(
-                                symbol=sym_upper, side="SHORT", margin_usdt=margin_usdt, 
+                                symbol=sym_key, side="SHORT", margin_usdt=margin_usdt, 
                                 leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price
                             )
                             if success:
@@ -234,16 +274,17 @@ class AtlantisStrategyRunner:
                                 current_state['in_position'] = True
                                 current_state['side'] = 'SHORT'
                                 current_state['entry_price'] = current_price
+                                current_state['strategy_type'] = strategy_type
                                 # Gerçek boyutu DB'den çek (senkronizasyon)
                                 await asyncio.sleep(0.5)  # DB kaydının tamamlanması için kısa bekle
-                                updated_trade = await db.get_open_trade(sym_upper)
+                                updated_trade = await db.get_open_trade(sym_key)
                                 if updated_trade:
                                     current_state['size'] = updated_trade['size']
-                                    logger.info(f"[{sym_upper}] State boyut güncellendi: {current_state['size']}")
+                                    logger.info(f"[{sym_key}] State boyut güncellendi: {current_state['size']} | Strateji: {strategy_type}")
                             await asyncio.sleep(10)
 
             except Exception as e:
-                logger.error(f"[{sym_upper}] ❌ Tarama döngüsünde kritik hata: {e}")
+                logger.error(f"[{sym_key}] ❌ Tarama döngüsünde kritik hata: {e}")
                 await asyncio.sleep(5)
 
             await asyncio.sleep(3)

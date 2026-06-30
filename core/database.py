@@ -38,6 +38,7 @@ class Database:
             entry_price FLOAT NOT NULL,
             stop_price FLOAT,
             close_price FLOAT,
+            stop_order_id VARCHAR(50),
             status VARCHAR(10) DEFAULT 'OPEN',
             pnl FLOAT DEFAULT 0.0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -45,15 +46,12 @@ class Database:
         );
         """
         
-        # Eğer tablo önceden oluşturulduysa, gerekli sütunları ekle (Migration)
-        query_migration_close = "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_price FLOAT;"
-        query_migration_stop_id = "ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_order_id VARCHAR(50);"
-        
         if self.pool:
             async with self.pool.acquire() as conn:
                 await conn.execute(query_table)
-                await conn.execute(query_migration_close)
-                await conn.execute(query_migration_stop_id)
+                # Migration: eski tabloda olmayan sütunları güvenle ekle
+                await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_price FLOAT;")
+                await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_order_id VARCHAR(50);")
                 logger.debug("Veritabanı tabloları ve şeması kontrol edildi/güncellendi.")
 
     async def insert_trade(self, symbol: str, side: str, leverage: int, size: float, entry_price: float, stop_price: float) -> int:

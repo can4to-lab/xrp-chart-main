@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import pandas as pd
 from exchange.binance_async import BinanceFuturesClient
 from core.database import db
 from core.notifier import notifier
@@ -13,15 +14,26 @@ class ExecutionEngine:
         self.client = client
         self.exchange = client.exchange
 
+    def _to_ccxt_symbol(self, symbol: str) -> str:
+        """'XRPUSDT' -> 'XRP/USDT' dönüşümü. CCXT bu formatta bekler."""
+        if '/' not in symbol:
+            # USDT, BUSD, USDC, BTC, ETH ile biten sembollerde / işareti ekle
+            for quote in ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB']:
+                if symbol.endswith(quote) and len(symbol) > len(quote):
+                    base = symbol[:-len(quote)]
+                    return f"{base}/{quote}"
+        return symbol
+
     async def execute_trade(self, symbol: str, side: str, margin_usdt: float, leverage: int, entry_price: float, stop_price: float) -> bool:
         try:
-            is_setup = await self.client.setup_margin_and_leverage(symbol, leverage)
+            sym_ccxt = self._to_ccxt_symbol(symbol)
+            is_setup = await self.client.setup_margin_and_leverage(sym_ccxt, leverage)
             if not is_setup: return False
 
             await self.exchange.load_markets()
             
             raw_size = (margin_usdt * leverage) / entry_price
-            formatted_size = float(self.exchange.amount_to_precision(symbol, raw_size))
+            formatted_size = float(self.exchange.amount_to_precision(sym_ccxt, raw_size))
             
             if (formatted_size * entry_price) < 5.0:
                 logger.warning(f"[{symbol}] İşlem hacmi < 5 USDT! İptal.")
@@ -34,17 +46,17 @@ class ExecutionEngine:
 
             # 1. BORSAYA GİRİŞ EMRİNİ GÖNDER
             entry_order = await self.exchange.create_order(
-                symbol=symbol, type='market', side=order_side, amount=formatted_size
+                symbol=sym_ccxt, type='market', side=order_side, amount=formatted_size
             )
             
             actual_entry_price = float(entry_order.get('average') or entry_order.get('price') or entry_price)
             actual_filled_size = float(entry_order.get('filled') or formatted_size)
-            formatted_stop_price = float(self.exchange.price_to_precision(symbol, stop_price))
+            formatted_stop_price = float(self.exchange.price_to_precision(sym_ccxt, stop_price))
             
             # 2. BORSAYA STOP LOSS EMRİNİ GÖNDER (VE GÜVENLİK KONTROLÜ)
             try:
                 await self.exchange.create_order(
-                    symbol=symbol, type='stop_market', side=stop_side, amount=actual_filled_size,
+                    symbol=sym_ccxt, type='stop_market', side=stop_side, amount=actual_filled_size,
                     params={'stopPrice': formatted_stop_price, 'reduceOnly': True}
                 )
                 logger.info(f"[{symbol}] ✅ İşleme Girildi ve Stop Loss Yerleştirildi.")
@@ -52,7 +64,7 @@ class ExecutionEngine:
                 logger.critical(f"[{symbol}] ⚠️ Stop Loss emri başarısız! Pozisyon ACİL kapatılıyor (Rollback). Hata: {sl_err}")
                 # Rollback: Açılan pozisyonu kapatmak için acil ters market emri gönderiyoruz
                 await self.exchange.create_order(
-                    symbol=symbol, type='market', side=stop_side, amount=actual_filled_size,
+                    symbol=sym_ccxt, type='market', side=stop_side, amount=actual_filled_size,
                     params={'reduceOnly': True}
                 )
                 return False
@@ -82,21 +94,22 @@ class ExecutionEngine:
 
     async def close_position(self, symbol: str, side: str, size: float, reason: str):
         try:
+            sym_ccxt = self._to_ccxt_symbol(symbol)
             # Önce DB'den açık pozisyon bilgilerini alalım (PnL hesaplayabilmek için)
             open_trade = await db.get_open_trade(symbol)
             
             close_side = 'sell' if side == 'LONG' else 'buy'
-            formatted_size = float(self.exchange.amount_to_precision(symbol, size))
+            formatted_size = float(self.exchange.amount_to_precision(sym_ccxt, size))
 
             # 1. Borsadan Pozisyonu Kapat
             close_order = await self.exchange.create_order(
-                symbol=symbol, type='market', side=close_side, amount=formatted_size,
+                symbol=sym_ccxt, type='market', side=close_side, amount=formatted_size,
                 params={'reduceOnly': True}
             )
             
             # 2. Borsadaki o sembole ait diğer tüm emirleri (Örn: Yetim Stop Loss) iptal et
             try:
-                await self.exchange.cancel_all_orders(symbol)
+                await self.exchange.cancel_all_orders(sym_ccxt)
                 logger.info(f"[{symbol}] Borsadaki tüm aktif emirler ve stop loss'lar temizlendi.")
             except Exception as cancel_err:
                 logger.warning(f"[{symbol}] Bekleyen emirler iptal edilirken uyarı: {cancel_err}")
@@ -104,7 +117,7 @@ class ExecutionEngine:
             # 3. Kapanış fiyatını ve PnL değerini hesapla
             actual_close_price = float(close_order.get('average') or close_order.get('price') or 0.0)
             if actual_close_price == 0.0:
-                ticker = await self.exchange.fetch_ticker(symbol)
+                ticker = await self.exchange.fetch_ticker(sym_ccxt)
                 actual_close_price = float(ticker.get('last', 0.0))
 
             pnl = 0.0
@@ -140,6 +153,7 @@ class ExecutionEngine:
         Order ID tabanlı güvenli yönetim ve rollback mekanizması ile.
         """
         try:
+            sym_ccxt = self._to_ccxt_symbol(symbol)
             # 1. Açık pozisyonu kontrol et
             open_trade = await db.get_open_trade(symbol)
             if not open_trade:
@@ -151,14 +165,14 @@ class ExecutionEngine:
             old_stop_order_id = open_trade.get('stop_order_id')
             
             # 2. Binance'daki aktif stop emirlerini bul
-            open_orders = await self.exchange.fetch_open_orders(symbol)
+            open_orders = await self.exchange.fetch_open_orders(sym_ccxt)
             stop_orders = [order for order in open_orders if order['type'] == 'stop_market']
             
             # 3. Eki stop emirlerini teker teker iptal et
             cancelled_order_ids = []
             for order in stop_orders:
                 try:
-                    await self.exchange.cancel_order(order['id'], symbol)
+                    await self.exchange.cancel_order(order['id'], sym_ccxt)
                     cancelled_order_ids.append(order['id'])
                     logger.info(f"[{symbol}] Eski stop emri iptal edildi: {order['id']}")
                 except Exception as cancel_err:
@@ -166,14 +180,14 @@ class ExecutionEngine:
                     # İptal edilemeyen emirleri logla ama devam et
 
             # 4. Yeni break-even stop fiyatını hesapla (ATR bazlı)
-            atr = await self._get_atr(symbol, period=14)
+            atr = await self._get_atr(sym_ccxt, period=14)
             if atr <= 0:
                 logger.error(f"[{symbol}] ATR hesaplanamadı, break-even stop kurulamıyor.")
                 return False
             
             # ATR'ye göre break-even stop (entry'ye yakın ama volatiliteye uygun)
             atr_multiplier = 0.5  # Break-even için orta seviye stop
-            ticker = await self.exchange.fetch_ticker(symbol)
+            ticker = await self.exchange.fetch_ticker(sym_ccxt)
             current_price = float(ticker.get('last', entry_price))
             
             if side == 'LONG':
@@ -185,14 +199,14 @@ class ExecutionEngine:
                 # Maksimum fiyat kontrolü (entry'den %3 üstüne çıkma)
                 breakeven_stop = min(breakeven_stop, entry_price * 1.03)
             
-            formatted_breakeven_stop = float(self.exchange.price_to_precision(symbol, breakeven_stop))
+            formatted_breakeven_stop = float(self.exchange.price_to_precision(sym_ccxt, breakeven_stop))
             stop_side = 'sell' if side == 'LONG' else 'buy'
 
             # 5. Yeni break-even stop emrini gönder
             new_stop_order_id = None
             try:
                 new_stop_order = await self.exchange.create_order(
-                    symbol=symbol, 
+                    symbol=sym_ccxt, 
                     type='stop_market', 
                     side=stop_side, 
                     amount=position_size,
@@ -213,7 +227,7 @@ class ExecutionEngine:
                     try:
                         # Eski stop emri zaten iptal edildi, yenisini oluştur
                         await self.exchange.create_order(
-                            symbol=symbol,
+                            symbol=sym_ccxt,
                             type='stop_market',
                             side=stop_side,
                             amount=position_size,
