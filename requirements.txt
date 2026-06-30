@@ -1,4 +1,9 @@
-streamlit
+ccxt
+fastapi
+uvicorn
+asyncpg
+python-dotenv
 pandas
 numpy
-plotly
+websockets
+apscheduler
