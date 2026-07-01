@@ -84,7 +84,8 @@ class AtlantisStrategyRunner:
                 df_signals = self.indicator.get_signals(df)
 
                 last_closed_candle = df_signals.iloc[-2]
-                current_price = df_signals.iloc[-1]['close']
+                last_candle = df_signals.iloc[-1]
+                current_price = last_candle['close']
 
                 # Yeni rejim değişimli sinyaller
                 regime = str(last_closed_candle.get('regime', 'UNKNOWN'))
@@ -96,27 +97,26 @@ class AtlantisStrategyRunner:
                 long_tp_signal = bool(last_closed_candle['long_tp_signal'])
                 short_tp_signal = bool(last_closed_candle['short_tp_signal'])
                 atr_stop_dist = float(last_closed_candle['atr_stop_dist'])
-                
-                # Geriye dönük uyumluluk (eski TBO sinyalleri)
-                is_3_green = bool(last_closed_candle.get('is_3_green', False))
-                is_3_red = bool(last_closed_candle.get('is_3_red', False))
 
-                # --- 🔍 DETAYLI TREND ANALİZİ ---
-                # Hareketli ortalama değerlerini alıyoruz
-                fast = last_closed_candle['fastTBO']
-                medium = last_closed_candle['mediumTBO']
-                medfast = last_closed_candle['medfastTBO']
-                slow = last_closed_candle['slowTBO']
+                # --- 📊 METRİK HESAPLAMALARI (en güncel mumdan) ---
+                adx_val = last_candle.get('adx', 0)
+                rsi_val = last_candle.get('rsi', 0)
+                vol_sma = last_candle.get('vol_sma', 0)
+                vol_ratio = (last_candle['volume'] / vol_sma) * 100 if vol_sma > 0 else 0
 
-                # LONG (3 Yeşil) Uyum Şartları: Fast > Medium > MedFast > Slow
-                l1 = "✅" if fast > medium else "❌"
-                l2 = "✅" if medium > medfast else "❌"
-                l3 = "✅" if medfast > slow else "❌"
+                # 1. Rejim ve Strateji Bilgisini Belirle
+                if adx_val < 20:
+                    regime_icon = "↔️ YATAY (RANGE)"
+                    strat_info = f"Mean Reversion (Bollinger) bekleniyor... [RSI: {rsi_val:.1f}]"
+                elif 20 <= adx_val <= 25:
+                    regime_icon = "🎯 SIKIŞMA (TRANSITION)"
+                    strat_info = "TTM Squeeze kırılımı bekleniyor..."
+                else:
+                    regime_icon = "🚀 TREND"
+                    strat_info = "Donchian Breakout / Pullback aranıyor..."
 
-                # SHORT (3 Kırmızı) Uyum Şartları: Fast < Medium < MedFast < Slow
-                s1 = "✅" if fast < medium else "❌"
-                s2 = "✅" if medium < medfast else "❌"
-                s3 = "✅" if medfast < slow else "❌"
+                # 2. Hacim Onayını Görselleştir
+                vol_status = "✅" if vol_ratio >= 120 else "❌"
 
                 # 3. Kritik Karar ve İşlem Bölgesi (LOCK İÇİNDE - Çift İşlem / Yarış Durumu Koruması)
                 async with lock:
@@ -132,25 +132,15 @@ class AtlantisStrategyRunner:
                     elif not open_trade and current_state['in_position']:
                         self.trade_state.reset_for_new_trade(sym_key)
 
-                    # Rejim ve strateji ikonları
-                    rejim_ikonu = {"RANGE": "↔️", "SQUEEZE": "🎯", "TREND": "📈"}.get(regime, "❓")
-                    strateji_ikonu = {
-                        "MEAN_REVERSION": "🔄",
-                        "SQUEEZE": "💥",
-                        "TREND": "🚀",
-                        "LIQUIDITY_SWEEP": "🎣"
-                    }.get(strategy_type, "❓")
-                    
-                    durum_ikonu = "🟢" if is_3_green else ("🔴" if is_3_red else "⚪")
-                    pozisyon_durumu = f"İÇERİDEYİZ: {current_state['side']}" if current_state['in_position'] else "NAKİTTE BEKLENİYOR"
+                    # Pozisyon durumu
+                    pozisyon_durumu = f"İÇERİDEYİZ: {current_state['side']}" if current_state['in_position'] else "NAKİTTE"
                     tp_durumu = " (TP ALINDI ✅)" if current_state['tp_taken'] else ""
-                    strateji_durumu = f" [{strategy_type}]" if current_state['strategy_type'] else ""
                     
-                    # Detaylandırılmış Log Çıktısı
+                    # Yeni Profesyonel Log Çıktısı (Quant tarzı)
                     logger.info(
-                        f"[{sym_key}] {rejim_ikonu} {regime} | {strateji_ikonu} Fiyat: {current_price:.4f} | {pozisyon_durumu}{tp_durumu}{strateji_durumu}\n"
-                        f"          └─ 📈 LONG Uyum : [F>M:{l1}] [M>MF:{l2}] [MF>S:{l3}]\n"
-                        f"          └─ 📉 SHORT Uyum: [F<M:{s1}] [M<MF:{s2}] [MF<S:{s3}]"
+                        f"[{sym_key}] {regime_icon} | 💵 Fiyat: {current_price:.4f} | {pozisyon_durumu}{tp_durumu}\n"
+                        f"          └─ 📊 Metrikler: ADX: {adx_val:.1f} | Hacim: %{vol_ratio:.0f} ({vol_status}) | RSI: {rsi_val:.1f}\n"
+                        f"          └─ 🎯 Strateji : {strat_info}"
                     )
   
                     # --- 1. HAYATTA KAL (ÇIKIŞ SİNYALİ KONTROLÜ) ---

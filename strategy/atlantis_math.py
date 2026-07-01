@@ -293,6 +293,7 @@ class AtlantisIndicator:
 
         # 2. Hacim Ortalaması ve Filtresi
         df['volume_ma'] = self.calculate_sma(df['volume'], self.volume_ma_period)
+        df['vol_sma'] = df['volume_ma']  # Runner'da kullanılan alias
         df['volume_ok'] = df['volume'] > (df['volume_ma'] * self.volume_multiplier)
 
         # 3. TBO (Geriye dönük uyumluluk - trend yönü için)
