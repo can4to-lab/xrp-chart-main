@@ -69,7 +69,7 @@ class RiskManager:
             notional_value = margin_to_use * leverage
 
             # 3. Alınacak Coin Adedini Hesapla
-            # Örnek: 200 USDT / 0.50 (XRP Fiyatı) = 400 adet XRP
+            # Örnek: 200 USDT / 0.50 (SOL Fiyatı) = 400 adet SOL
             raw_size = notional_value / entry_price
             
             # Not: Ondalık (precision) kırpmayı Engine dosyamız otomatik yaptığı için

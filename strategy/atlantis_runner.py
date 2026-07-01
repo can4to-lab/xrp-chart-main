@@ -51,9 +51,9 @@ class AtlantisStrategyRunner:
     """Tam otonom Atlantis tarayıcısı: Çift işlem korumalı ve Çıkış kontrollü."""
 
     def __init__(self, symbols: List[str], execution_engine, risk_manager, client, timeframe: str = '5m'):
-        # Orijinal sembol formatını (örn. "XRP/USDT") koru - CCXT bu formatta bekler
+        # Orijinal sembol formatını (örn. "SOL/USDT") koru - CCXT bu formatta bekler
         self.symbols = symbols  # Orijinal haliyle sakla
-        # Lock/state anahtarı için normalize edilmiş versiyon (örn. "XRPUSDT")
+        # Lock/state anahtarı için normalize edilmiş versiyon (örn. "SOLUSDT")
         self.symbol_keys = [s.replace("/", "").upper() for s in symbols]
         self.execution_engine = execution_engine
         self.risk_manager = risk_manager
@@ -65,8 +65,8 @@ class AtlantisStrategyRunner:
         logger.info("🛠️ Atlantis İndikatör Matematiği ve Durum Hafızası belleğe yüklendi.")
 
     async def _scan_market_for_symbol(self, symbol: str):
-        # CCXT için orijinal format (örn. "XRP/USDT"), lock/state için normalize (örn. "XRPUSDT")
-        sym_ccxt = symbol  # CCXT "XRP/USDT" formatını bekler
+        # CCXT için orijinal format (örn. "SOL/USDT"), lock/state için normalize (örn. "SOLUSDT")
+        sym_ccxt = symbol  # CCXT "SOL/USDT" formatını bekler
         sym_key = symbol.replace("/", "").upper()  # Lock/state anahtarı
         lock = state.get_symbol_lock(sym_key) # Sembole özel kilit alınıyor
         logger.info(f"[{sym_key}] 🔍 {self.timeframe} periyotlu piyasa taraması başlatıldı.")

@@ -15,7 +15,7 @@ class ExecutionEngine:
         self.exchange = client.exchange
 
     def _to_ccxt_symbol(self, symbol: str) -> str:
-        """'XRPUSDT' -> 'XRP/USDT' dönüşümü. CCXT bu formatta bekler."""
+        """'SOLUSDT' -> 'SOL/USDT' dönüşümü. CCXT bu formatta bekler."""
         if '/' not in symbol:
             # USDT, BUSD, USDC, BTC, ETH ile biten sembollerde / işareti ekle
             for quote in ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH', 'BNB']:

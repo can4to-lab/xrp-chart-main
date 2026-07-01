@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("Atlantis_Node")
 
 # Takip Edilecek Semboller
-TARGET_SYMBOLS = ["XRP/USDT"]
+TARGET_SYMBOLS = ["SOL/USDT"]
 
 # Global bileşenleri tanımla
 binance_client = None
@@ -47,7 +47,7 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
             contracts = float(pos.get('contracts', 0.0)
                               or pos.get('positionAmt', 0.0) or 0.0)
             if abs(contracts) > 0.0:
-                # "XRP/USDT:USDT" -> "XRPUSDT" dönüşümü (DB formatı)
+                # "SOL/USDT:USDT" -> "SOLUSDT" dönüşümü (DB formatı)
                 sym = pos['symbol'].split(':')[0].replace('/', '')
 
                 pos_side = 'LONG' if contracts > 0 else 'SHORT'
@@ -69,8 +69,8 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
 
         # 3. Durum A & C Kontrolü: DB'de açık olanların borsadaki karşılıklarını denetle
         for db_trade in db_open_trades:
-            symbol = db_trade['symbol']  # DB formatı: "XRPUSDT"
-            # CCXT formatı: "XRP/USDT"
+            symbol = db_trade['symbol']  # DB formatı: "SOLUSDT"
+            # CCXT formatı: "SOL/USDT"
             sym_ccxt = symbol.replace('USDT', '/USDT', 1) if 'USDT' in symbol else symbol
 
             if symbol not in binance_positions:
