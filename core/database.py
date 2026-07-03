@@ -72,8 +72,44 @@ class Database:
                 await conn.execute(query_table)
                 await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_taken BOOLEAN NOT NULL DEFAULT FALSE;")
                 await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(50) NOT NULL DEFAULT 'UNKNOWN';")
-                await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_symbol_open ON trades (symbol) WHERE status = 'OPEN';")
-                logger.debug("Veritabanı tabloları ve şeması kontrol edildi/güncellendi.")
+                try:
+                    await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_symbol_open ON trades (symbol) WHERE status = 'OPEN';")
+                    logger.debug("Veritabanı tabloları ve şeması kontrol edildi/güncellendi.")
+                except Exception as e:
+                    logger.error(f"❌ İndeks oluşturulurken hata: {e}")
+                    # Eğer açık (OPEN) statüsünde aynı symbol için birden fazla kayıt varsa, indeks oluşturulamaz.
+                    # Bu durumda eski/duplicate kayıtları kapatıp indeks oluşturmayı tekrar deniyoruz.
+                    try:
+                        duplicates_query = """
+                        SELECT symbol, array_agg(id ORDER BY created_at DESC) AS ids, COUNT(*) as cnt
+                        FROM trades
+                        WHERE status = 'OPEN'
+                        GROUP BY symbol
+                        HAVING COUNT(*) > 1
+                        """
+                        duplicates = await conn.fetch(duplicates_query)
+                        if duplicates:
+                            for rec in duplicates:
+                                symbol = rec['symbol']
+                                ids = rec['ids']
+                                # Keep the most recent (first in ordered array), close the rest
+                                keep_id = ids[0]
+                                remove_ids = ids[1:]
+                                if remove_ids:
+                                    await conn.execute(
+                                        """
+                                        UPDATE trades
+                                        SET status = 'CLOSED', reason = 'Startup dedupe: closed duplicate open records', updated_at = CURRENT_TIMESTAMP
+                                        WHERE id = ANY($1::int[])
+                                        """,
+                                        remove_ids,
+                                    )
+                                    logger.warning(f"[{symbol}] {len(remove_ids)} duplicate OPEN kayıt kapatıldı (IDs: {remove_ids})")
+                        # indeks tekrar deneniyor
+                        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_symbol_open ON trades (symbol) WHERE status = 'OPEN';")
+                        logger.info("✅ İndeks başarıyla oluşturuldu (duplikatlar temizlendi).")
+                    except Exception as e2:
+                        logger.critical(f"❌ İndeks oluşturma/duplikat temizleme başarısız: {e2}")
 
     async def insert_pending_trade(self, symbol: str, side: str, leverage: int, size: float, entry_price: float, stop_price: float) -> int:
         """Yeni açılan bir işlemi 'PENDING' statüsüyle veritabanına kaydeder."""
