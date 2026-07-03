@@ -2,6 +2,7 @@
 import ccxt.async_support as ccxt
 import logging
 import asyncio
+from core.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +15,13 @@ class BinanceFuturesClient:
             'apiKey': api_key,
             'secret': secret_key,
             'enableRateLimit': True,
+            'timeout': int(config.API_TIMEOUT_SECONDS * 1000),
             'options': {
                 'defaultType': 'future',  # Spot değil, USDT-M Futures
                 'adjustForTimeDifference': True
             }
         })
+        self.api_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_API_CALLS)
         
         if testnet:
             # Demo Trading modu (set_sandbox_mode yerine)
@@ -40,7 +43,16 @@ class BinanceFuturesClient:
         delay = initial_delay
         for attempt in range(max_retries):
             try:
-                return await coro_func()
+                async with self.api_semaphore:
+                    return await asyncio.wait_for(coro_func(), timeout=config.API_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as timeout_err:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ API çağrısı timeout {attempt + 1}/{max_retries} (Bekleme: {delay}s): {timeout_err}")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+                else:
+                    logger.error(f"❌ API çağrısı timeout oldu (son deneme): {timeout_err}")
+                    raise
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"⚠️ API çağrısı retry {attempt + 1}/{max_retries} (Bekleme: {delay}s): {type(e).__name__}")

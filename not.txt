@@ -1,0 +1,352 @@
+Harika tespitler yaptın, vizyonumu çok genişlettin. Önerdiğin bu 3 kritik konuyu (State Kurtarma, Atomik Emirler ve WebSocket Mimarisi) sisteme entegre etmek için kolları sıvadım. Lütfen bana şu konularda pratik kod şablonları ve mimari tavsiyeler ver:
+
+1. State Recovery (Durum Kurtarma):tp_taken, strategy_type ve in_position gibi anlık durumları (RAM'de tutulan state'leri) veritabanına kaydettik diyelim. Bot aniden çöktüğünde (Crash) veya sunucu yeniden başlatıldığında, atlantis_runner.py ayağa kalkarken veritabanındaki (DB) bu açık işlemleri okuyup, kendi hafızasını (memory) kayıpsız bir şekilde yeniden nasıl inşa etmeli? Bunun için nasıl bir _recover_state_from_db() fonksiyonu yazmalıyım?
+
+2. Atomik Emir Güncelleme (Cancel & Replace):
+
+Binance API'de TP seviyesine gelindiğinde stop'u maliyete (Break-even) çekerken, eski stop'u iptal edip yenisini gönderme arasındaki o milisaniyelik boşlukta (Delta Risk) piyasa çökerse korumasız kalırız. Binance'in "Cancel & Replace" (Atomik) endpoint'ini kullanarak bu işlemi tek bir API çağrısıyla risksiz bir şekilde nasıl koda dökerim?
+
+3. Event-Driven (WebSocket) Mimariye Geçiş:
+
+Şu an REST API ile sürekli borsaya "Yeni mum kapandı mı?" diye soruyoruz (Polling). Bunu Binance WebSocket Kline/Candlestick stream'ine geçirerek Event-Driven (Olay Yönlendirmeli) bir yapı kurmak istersem, mevcut atlantis_runner asenkron (asyncio) döngümü nasıl bir şablona oturtmalıyım? Bana sadece ana iskeleti (WebSocket dinleyici ve sinyal tetikleyici bağlantısını) gösterir misin? 
+
+Harika bir vizyonla harekete geçmişsin. Bu 3 konuyu sisteme entegre ettiğinde, botun amatör bir betik (script) olmaktan çıkıp, "Institutional-Grade" (kurumsal seviye) bir HFT/Quant mimarisine adım atacak.
+
+Mevcut dosya yapını (atlantis_runner.py, engine.py, database.py ve requirements.txt içinde hazır bulunan websockets kütüphanesi) göz önüne alarak sana doğrudan projene entegre edebileceğin şablonlar hazırladım.
+
+1. State Recovery (Durum Kurtarma) Mekanizması
+Bot çöktüğünde RAM'deki TradeState sıfırlanır. Bot ayağa kalktığında, database.py'deki verileri kullanarak hafızayı yeniden inşa etmeliyiz. Öncelikle veritabanındaki trades tablosuna tp_taken (BOOLEAN) ve strategy_type (VARCHAR) sütunlarını eklediğini varsayıyoruz.
+
+atlantis_runner.py içerisindeki AtlantisStrategyRunner sınıfına şu metodu ekleyebilirsin:
+
+Python
+    async def _recover_state_from_db(self):
+        """
+        Bot çöktükten sonra yeniden başlarken, veritabanındaki AÇIK (OPEN) 
+        işlemleri okur ve RAM'deki TradeState'i (hafızayı) kayıpsız onarır.
+        """
+        logger.info("🔄 State Recovery: RAM hafızası veritabanından restore ediliyor...")
+        
+        # db.get_all_open_trades() fonksiyonunun tp_taken ve strategy_type döndürdüğünü varsayıyoruz
+        open_trades = await db.get_all_open_trades() 
+        
+        restored_count = 0
+        for trade in open_trades:
+            symbol = trade['symbol'] # Örn: "SOLUSDT"
+            
+            # RAM'deki state'i doğrudan güncelle
+            state_dict = self.trade_state.get_state(symbol)
+            state_dict['in_position'] = True
+            state_dict['side'] = trade['side']
+            state_dict['entry_price'] = trade['entry_price']
+            state_dict['size'] = trade['size']
+            state_dict['tp_taken'] = trade.get('tp_taken', False)
+            state_dict['strategy_type'] = trade.get('strategy_type', 'UNKNOWN')
+            
+            restored_count += 1
+            logger.info(f"[{symbol}] 💾 State Restore Edildi -> Yön: {state_dict['side']}, Boyut: {state_dict['size']}, TP: {state_dict['tp_taken']}, Strateji: {state_dict['strategy_type']}")
+            
+        logger.info(f"✅ Başarıyla {restored_count} sembolün state'i hafızaya yüklendi.")
+Nereye Eklenmeli? Bu fonksiyonu main.py içerisindeki lifespan metodunda strategy_runner = AtlantisStrategyRunner(...) bloğundan hemen sonra, start() çağrılmadan önce çağırmalısın.
+
+2. Atomik Emir Güncelleme (Cancel & Replace)
+Mevcut sistemde engine.py içerisinde move_stop_to_breakeven metodunda önce eski emri iptal edip (cancel_order), sonra yenisini yaratıyorsun (create_order). Bu aralıktaki milisaniyelik boşluk ölümcüldür.
+
+CCXT kütüphanesi Binance Futures için edit_order metodunu destekler. Bu metod arka planda Binance API'nin PUT /fapi/v1/order (Cancel Replace) endpoint'ini kullanır. Yani işlem atomiktir; yeni emir oluşturulamazsa eskisi iptal edilmez.
+
+execution/engine.py dosyanızdaki move_stop_to_breakeven fonksiyonunun 3. ve 5. adımlarını şu şekilde birleştirerek değiştirebilirsin:
+
+Python
+    async def edit_stop_loss_atomic(self, symbol: str, old_order_id: str, new_stop_price: float, position_size: float, side: str):
+        """
+        Milisaniyelik boşluk (naked window) yaratmadan atomik olarak eski stop'u 
+        yeni break-even fiyatıyla günceller (Cancel & Replace).
+        """
+        sym_ccxt = self._to_ccxt_symbol(symbol)
+        stop_side = 'sell' if side == 'LONG' else 'buy'
+        formatted_stop = float(self.exchange.price_to_precision(sym_ccxt, new_stop_price))
+        
+        try:
+            # CCXT edit_order Binance'te CancelReplace (Atomik) işlemi yapar
+            updated_order = await self.exchange.edit_order(
+                id=old_order_id,
+                symbol=sym_ccxt,
+                type='stop_market',
+                side=stop_side,
+                amount=position_size,
+                params={
+                    'stopPrice': formatted_stop,
+                    'reduceOnly': True
+                }
+            )
+            logger.info(f"[{symbol}] ✅ Atomik Güncelleme Başarılı! Eski Stop: {old_order_id} -> Yeni Stop: {formatted_stop}")
+            return updated_order.get('id')
+            
+        except Exception as e:
+            # Atomik işlem başarısız olduysa eski emir HALA GEÇERLİDİR. 
+            # Güvendesiniz, çıplak (naked) kalmadınız.
+            logger.error(f"[{symbol}] ⚠️ Atomik Cancel&Replace başarısız oldu! Eski stop emri devrede. Hata: {str(e)}")
+            return None
+3. Event-Driven (WebSocket) Mimariye Geçiş Ana İskeleti
+Sürekli REST API ile "Yeni mum geldi mi?" diye sormak (Polling), 50 coine çıktığında Binance IP Ban (Weight Limit) yemana sebep olur. Projendeki requirements.txt dosyasında bulunan websockets kütüphanesini kullanarak atlantis_runner.py içindeki sonsuz while self._running döngüsünü Event-Driven hale getirelim.
+
+İşte sana _scan_market_for_symbol fonksiyonunu tamamen çöpe attıracak, yeni nesil WebSocket Event Loop iskeleti:
+
+Python
+import json
+import asyncio
+import websockets
+import pandas as pd
+
+class AtlantisStrategyRunner:
+    # ... mevcut init metodun ...
+
+    async def _ws_listen_kline(self, symbol: str):
+        """
+        Binance WebSocket üzerinden kline (mum) verilerini dinler.
+        SADECE mum kapandığında (is_closed=True) sinyal motorunu tetikler.
+        """
+        sym_ws = symbol.replace("/", "").lower() # Örn: solusdt
+        tf = self.timeframe
+        wss_url = f"wss://fstream.binance.com/ws/{sym_ws}@kline_{tf}"
+        sym_key = symbol.replace("/", "").upper()
+
+        # Bot başlarken 200 mumluk geçmişi BİR KERE REST API ile çek ve belleğe al
+        logger.info(f"[{sym_key}] Başlangıç geçmiş verisi çekiliyor...")
+        ohlcv_history = await self.client.fetch_ohlcv_with_retry(symbol, timeframe=tf, limit=200)
+        df_memory = pd.DataFrame(ohlcv_history, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+        while self._running:
+            try:
+                async with websockets.connect(wss_url) as ws:
+                    logger.info(f"[{sym_key}] 🟢 WebSocket bağlantısı kuruldu.")
+                    
+                    while self._running:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        kline = data['k']
+                        
+                        # Eğer mum kapandıysa (is_closed == True), sinyal motorunu tetikle!
+                        is_closed = kline['x']
+                        
+                        if is_closed:
+                            # 1. Yeni mumu bellekteki DataFrame'e ekle
+                            new_candle = {
+                                'timestamp': kline['t'],
+                                'open': float(kline['o']),
+                                'high': float(kline['h']),
+                                'low': float(kline['l']),
+                                'close': float(kline['c']),
+                                'volume': float(kline['v'])
+                            }
+                            # En eski mumu at, yenisini sona ekle (Hızlı hafıza yönetimi)
+                            df_memory = df_memory.iloc[1:].copy()
+                            df_memory.loc[len(df_memory)] = new_candle
+                            
+                            # 2. İndikatörleri ve Sinyalleri hesapla
+                            # Bu noktadan sonra eski _scan_market_for_symbol mantığına geçiş yapıyorsun
+                            await self._process_closed_candle(sym_key, df_memory)
+                            
+            except websockets.ConnectionClosed:
+                logger.warning(f"[{sym_key}] 🔴 WebSocket bağlantısı koptu. 5 saniye sonra yeniden bağlanılıyor...")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"[{sym_key}] WS Hatası: {e}")
+                await asyncio.sleep(5)
+
+    async def _process_closed_candle(self, sym_key: str, df: pd.DataFrame):
+        """
+        Mum kapandığında çalışacak asıl karar/sinyal motoru.
+        Eski _scan_market_for_symbol içindeki lock() ve logic işlemlerin buraya gelecek.
+        """
+        df_signals = self.indicator.get_signals(df)
+        
+        # State kontrolleri, Engine işlemleri ve Kâr/Zarar/Giriş Kararları burada yapılacak.
+        # ... 
+        # (Eski _scan_market_for_symbol içindeki async with lock: bloğu tamamen buraya yapıştırılacak)
+Nasıl Çalıştırılır? start() fonksiyonunda self._scan_market_for_symbol yerine bu yeni self._ws_listen_kline metodunu asyncio.create_task olarak çağıracaksın. Artık botun CPU'yu yormadan sessizce bekleyecek ve sadece 5 dakikalık (veya timeframe neyse) mum kapanış saniyesinde aslan gibi uyanıp nanosaniyeler içinde işlemini yapacaktır.
+
+bu yapılan değişiklikle benim kodumdaki loglama ekranını da bozdun.
+
+ Event-Driven (WebSocket) Mimariye Geçiş Ana İskeleti yaptığın bu değişikliği anlamadım. benim kodum tıkır tıkır çalışıyor nerde sorun yaşayacağımı düşündün?
+
+Kodunun şu an 1, 2 veya 3 coin ile tıkır tıkır çalıştığına eminim, çünkü yazdığın while döngüsü mantıksal olarak doğru. Benim işaret ettiğim sorun, kodun şu anki hali değil; botu ölçeklendirmek istediğinde (örneğin 30, 50 veya 100 coin taramak istediğinde) çok sert bir şekilde çarpacağın iki büyük duvardır.
+
+Bir Quant (Algoritmik Ticaret) sisteminde, kodun çalışması kadar "nasıl kaynak tükettiği" de önemlidir. İşte tam olarak sorun yaşayacağın 2 kritik nokta:
+
+1. Duvara Çarpma: Binance IP Ban (REST API Limitleri)
+Şu anki yapında (atlantis_runner.py içindeki while self._running döngüsü) botun şöyle çalışıyor:
+
+3 saniyede bir Binance'in kapısını çalıp fetch_ohlcv ile son 200 mumu istiyorsun.
+
+1 coin için: Dakikada 20 istek (sorun yok).
+
+50 coin için: Dakikada 1000 istek yapar!
+
+Binance'in REST API'si için belirli "Weight" (Ağırlık) limitleri vardır (örneğin dakikada 2400 weight). Eğer 50 coin için her 3 saniyede bir mum verisi istersen, Binance seni DDOS saldırısı yapıyor zannedecek ve önce HTTP 429 (Too Many Requests) hatası fırlatacak, ısrar edersen IP adresini banlayacaktır. Botun aniden kör ve sağır kalır.
+
+2. Duvara Çarpma: İşlemci (CPU) İsrafı ve Gecikme
+Diyelim ki timeframe = '5m' (5 dakikalık mumlar) kullanıyorsun.
+Senin botun, o 5 dakikalık mum kapanana kadar, her 3 saniyede bir:
+
+Piyasadan 200 mumu çekiyor.
+
+get_signals(df) fonksiyonunu çağırıyor.
+
+ADX, ATR, Bollinger, Keltner, Donchian, RSI gibi ağır Pandas hesaplamalarının hepsini sıfırdan tekrar hesaplıyor.
+
+Bir mum 5 dakikada (300 saniyede) kapanır. Sen her 3 saniyede bir kontrol ediyorsan, aynı mum kapanana kadar tam 100 kere aynı ağır matematiği işlemcine (CPU) yaptırıyorsun. 50 coinde bu 5000 gereksiz hesaplama demek. Sunucunun işlemcisi %100'e vurur, fanlar çıldırır ve asıl sinyal geldiğinde botun yorgunluktan emri borsaya geç iletir (Slippage yaşarsın).
+
+Metaforla Anlatım (REST vs WebSocket)
+Senin Şu Anki Kodun (REST Polling): Arabanın arka koltuğunda oturan ve her 3 saniyede bir babasına "Baba geldik mi? Baba geldik mi? Baba geldik mi?" diye soran çocuk gibidir. Babayı (Binance) ve kendini (CPU) yorar.
+
+Benim Önerdiğim WebSocket: Babanın çocuğa "Sen uyu, geldiğimizde ben seni uyandıracağım" demesidir. Botun hiçbir hesaplama yapmadan uyur, Binance sadece "Mum kapandı!" dediği o tek milisaniyede uyanır, matematiği 1 kez yapar, emri atar ve tekrar uyur. %99 CPU tasarrufu sağlarsın, Binance seni asla banlamaz.
+
+Loglama Ekranı Neden Bozuldu?
+Bir önceki mesajında "Loglama ekranını da bozdun" dedin, çok haklısın. Sana WebSocket iskeletini gösterirken kodun çok uzun olmaması için senin o çok şık yazdığın loglama bloğunu bilerek atladım ([SOLUSDT] ↔️ YATAY (RANGE) | 💵 Fiyat:... kısmı).
+
+O loglamayı kaybetmene gerek yok. WebSocket mimarisinde o log bloğunu, mum kapandığı anı yakalayan _process_closed_candle (veya senin adlandıracağın) fonksiyonun içine aynen kopyalayacaksın. Sadece, saniyede bir ekrana basmak yerine, her mum kapandığında (örneğin 5 dakikada bir) ekrana basacak.
+
+Özetle: Kodun şu an mükemmel. Sadece 1-2 coinle oynayacaksan ve sunucun güçlüyse REST API (şu anki halin) ile devam edebilirsin, hiç dokunma. Ama "Ben bu botu 50 coin'e salacağım, kendi kendine piyasayı süpürsün" diyorsan, WebSocket mimarisine geçmek bir seçenek değil, zorunluluktur. Karar senin.
+
+Harika tavsiyelerinle sistemi uçurduk! WebSockets (Event-Driven) mimarisini kurmaktan vazgeçtim ve Cancel & Replace (Atomik) emir güncellemesini CCXT edit_order ile entegre ettim. Sistem şu an milisaniye hızında ve naked window (korumasız pencere) riski sıfır.
+
+Şimdi sistemi tek bir coinden çıkartıp 50 coinlik bir portföye (Scale-up) ölçeklendirmek ve tam anlamıyla kurumsal bir Production ortamına hazırlamak istiyorum. Lütfen bana şu 3 ileri düzey mimari sorun için kod şablonları (snippet) ve çözüm yolları sun:
+
+1. State Recovery (Hafıza Kurtarma) Fonksiyonu:
+
+Daha önce bahsettiğin o kritik konuya geldik. Bot sunucusu (Render) reset attığında, atlantis_runner.py ayağa kalkarken veritabanındaki (PostgreSQL/NeonDB) trades tablosunu okuyup; açık pozisyonları, tp_taken durumlarını ve strategy_type bilgisini RAM'deki trade_state sözlüğüne kayıpsız olarak nasıl yüklemeli? Bana bir _recover_state_from_db() fonksiyon iskeleti yazar mısın?
+
+2. Thundering Herd (Eşzamanlı Yük Patlaması) Problemi:
+
+Zaman dilimim 5m (5 dakika). Saat 14:05 olduğunda Binance WS üzerinden 50 coinin mumu aynı milisaniyede kapanacak. Benim _process_closed_candle fonksiyonum aynı anda 50 kere tetiklenecek. Veritabanı bağlantı havuzumun (Connection Pool) çökmemesi veya asyncio Event Loop'un bloke olmaması için bu 50 işlemi nasıl bir asyncio.Queue (Kuyruk) veya asyncio.Semaphore mimarisiyle eritebilirim?
+
+3. WS Silent Drop (Sessiz Kopma) ve Watchdog (Bekçi Köpeği):
+
+Binance WebSockets bazen hata fırlatmadan (Exception vermeden) sessizce veri göndermeyi kesebiliyor (Silent Drop). Bu durumda bot sonsuza kadar mum bekliyor. Bağlantının donduğunu tespit etmek ve WS'yi otomatik yeniden başlatmak için arka planda çalışan bir Watchdog Timer veya Ping/Pong kontrol mekanizmasını koda nasıl yedirmeliyim? 
+
+Öncelikle ufak bir karışıklığı düzeltelim: Birinci cümlende "WebSockets mimarisini kurmaktan vazgeçtim" demişsin ama 2. ve 3. sorularda tamamen Binance WS (WebSocket) mimarisinin üretim ortamı (Production) sorunlarına değinmişsin. Sanırım "REST Polling (sürekli istek atma) mimarisinden vazgeçtim ve WS'ye geçtim" demek istedin. Çünkü sorduğun sorular tam anlamıyla Kurumsal WebSocket (Institutional WS) mimarisinin en ağır mühendislik problemleridir.
+
+Sistemi 50+ coine (Scale-up) ölçeklerken yaşayacağın bu 3 büyük darboğaz için hazırladığım Quant seviyesi çözümler ve mimari şablonlar aşağıdadır:
+
+1. State Recovery (Hafıza Kurtarma) Fonksiyonu
+Render, AWS veya kendi sunucun hiç fark etmez; sunucular çöker (Crash), yeniden başlatılır (Restart) veya kod güncellenir. Bot ayağa kalkarken database.py üzerinden açık pozisyonları okuyup RAM'deki TradeState'i (durum hafızası) onarmalıdır.
+
+atlantis_runner.py dosyandaki AtlantisStrategyRunner sınıfına şu metodu eklemelisin:
+
+Python
+    async def _recover_state_from_db(self):
+        """
+        Bot çöktükten sonra yeniden başlarken, veritabanındaki AÇIK (OPEN) 
+        işlemleri okur ve RAM'deki TradeState'i (hafızayı) kayıpsız onarır.
+        """
+        logger.info("🔄 RAM State Recovery başlatılıyor...")
+        
+        # db.get_all_open_trades() çağrısı ile açık işlemleri çekiyoruz
+        open_trades = await db.get_all_open_trades() 
+        
+        restored_count = 0
+        for trade in open_trades:
+            sym_key = trade['symbol'] # Örn: "SOLUSDT"
+            
+            # RAM'deki state sözlüğünü (dictionary) al ve güncelle
+            state_dict = self.trade_state.get_state(sym_key)
+            state_dict['in_position'] = True
+            state_dict['side'] = trade['side']
+            state_dict['entry_price'] = trade['entry_price']
+            state_dict['size'] = trade['size']
+            
+            # Eğer db'ye bu sütunları eklediysen doğrudan çek, yoksa varsayılan ata
+            state_dict['tp_taken'] = trade.get('tp_taken', False) 
+            state_dict['strategy_type'] = trade.get('strategy_type', 'UNKNOWN')
+            
+            restored_count += 1
+            logger.info(f"[{sym_key}] 💾 Hafıza Onarıldı -> Yön: {state_dict['side']}, Boyut: {state_dict['size']}, TP: {state_dict['tp_taken']}")
+            
+        logger.info(f"✅ Başarıyla {restored_count} sembolün state'i hafızaya yüklendi.")
+Kullanımı: main.py dosyasında, task_strategy = asyncio.create_task(strategy_runner.start()) satırından hemen önce await strategy_runner._recover_state_from_db() diyerek botu taramaya başlamadan önce hafızasını onarmaya zorlamalısın.
+
+2. Thundering Herd (Eşzamanlı Yük Patlaması) Problemi
+Saat tam 14:05:00 olduğunda Binance 50 coinin mum kapanış sinyalini sana aynı milisaniyede yollayacak. Eğer her biri için aynı anda 50 tane _process_closed_candle çalıştırırsan:
+
+database.py'deki PostgreSQL (NeonDB) Connection Pool'un tükenir (Too many connections hatası).
+
+CPU ani bir Spike yapar ve kilitlenir.
+
+Çözüm (Producer-Consumer Mimarisi): asyncio.Semaphore yerine asyncio.Queue (Kuyruk) kullanmak en profesyonelidir. WS'ler (Producer) sinyali yakaladığında hemen işlem yapmak yerine veriyi bir "Kuyruğa" atar. Arka planda çalışan 3-5 tane "İşçi" (Worker / Consumer) bu kuyruğu sırayla eritir.
+
+Python
+    def __init__(self, ...):
+        # ... mevcut init kodların ...
+        self.signal_queue = asyncio.Queue() # Thundering Herd engelleyici kuyruk
+        self.workers = [] # Arka plan işçileri
+        self.WORKER_COUNT = 5 # Aynı anda en fazla 5 coin işlenecek (DB'yi yormaz)
+
+    async def start(self):
+        self._running = True
+        logger.info(f"🏁 Atlantis Motoru {len(self.symbols)} sembol için başlatılıyor...")
+        
+        # 1. İşçileri (Workers) Başlat
+        for i in range(self.WORKER_COUNT):
+            worker_task = asyncio.create_task(self._candle_worker(f"Worker-{i}"))
+            self.workers.append(worker_task)
+            
+        # 2. WebSocket Dinleyicileri Başlat (Producer)
+        ws_tasks = [asyncio.create_task(self._ws_listen_kline(symbol)) for symbol in self.symbols]
+        await asyncio.gather(*ws_tasks)
+
+    # --- WS İÇİNDE MUM KAPANDIĞINDA YAPILACAK İŞLEM ---
+    # if is_closed:
+    #      # Sinyali işlemek yerine KUYRUĞA (Queue) at ve WS dinlemeye devam et!
+    #      await self.signal_queue.put((sym_key, df_memory.copy())) 
+
+    async def _candle_worker(self, worker_name: str):
+        """Kuyruktaki sinyalleri sırayla ve güvenli hızda eriten işçi"""
+        logger.info(f"👷 {worker_name} göreve hazır.")
+        while self._running:
+            sym_key, df = await self.signal_queue.get() # Kuyruktan iş al
+            try:
+                # Ağır pandas hesaplamaları ve DB işlemleri burada yapılıyor
+                await self._process_closed_candle(sym_key, df)
+            except Exception as e:
+                logger.error(f"[{sym_key}] ❌ {worker_name} İşleme hatası: {e}")
+            finally:
+                self.signal_queue.task_done() # İşin bittiğini kuyruğa bildir
+3. WS Silent Drop (Sessiz Kopma) ve Watchdog (Bekçi Köpeği)
+Binance WS bazen HTTP hatası veya Exception fırlatmadan "Zombi" durumuna geçer ve sana veri göndermeyi keser. Bu yüzden try-except blokları bunu yakalayamaz. Python'da bunu çözmenin en şık yolu asyncio.wait_for ile Timeout (Zaman Aşımı) belirlemektir.
+
+Binance 5 dakikalık mumlar için bile olsa saniyede 1 kere canlı veri akışı (kline update) gönderir. Eğer 30 saniye boyunca hiçbir veri gelmiyorsa, bağlantı sessizce ölmüş demektir.
+
+Python
+    async def _ws_listen_kline(self, symbol: str):
+        sym_ws = symbol.replace("/", "").lower()
+        wss_url = f"wss://fstream.binance.com/ws/{sym_ws}@kline_{self.timeframe}"
+        sym_key = symbol.replace("/", "").upper()
+
+        while self._running:
+            try:
+                async with websockets.connect(wss_url) as ws:
+                    logger.info(f"[{sym_key}] 🟢 WebSocket bağlantısı kuruldu.")
+                    
+                    while self._running:
+                        try:
+                            # KRİTİK NOKTA: Veri beklerken 30 saniyelik Watchdog kronometresi çalışır!
+                            msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                            
+                            data = json.loads(msg)
+                            kline = data['k']
+                            
+                            # (Mum kapanış kontrolleri ve Queue.put işlemleri burada...)
+                            
+                        except asyncio.TimeoutError:
+                            # 30 saniye boyunca hiçbir veri gelmediyse Silent Drop olmuştur.
+                            logger.error(f"[{sym_key}] 🔴 WS Silent Drop Tespit Edildi! Zombi bağlantı kesiliyor...")
+                            break # İç döngüyü (while) kırar. ws bloğundan çıkar ve dış döngü tekrar bağlanır.
+                            
+            except websockets.ConnectionClosed:
+                logger.warning(f"[{sym_key}] 🟠 WebSocket normal kapandı. Yeniden bağlanılıyor...")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"[{sym_key}] ❌ Beklenmeyen WS Hatası: {e}")
+                await asyncio.sleep(5)
+Bu üç mimariyle (State Recovery, Worker Queue ve Watchdog Timeout) sistemin gerçek bir HFT/Quant altyapısına kavuşmuş olur. Sinyaller sırayla akar, DB bağlantın güvende kalır ve botun sessizce sağır olmaz.

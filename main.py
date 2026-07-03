@@ -191,6 +191,9 @@ async def lifespan(app: FastAPI):
         timeframe=config.TIMEFRAME
     )
 
+    # Açık pozisyonlar varsa RAM state'e geri yükle
+    await strategy_runner.restore_state_from_db()
+
     # Strateji döngüsünü arka planda asenkron olarak çalıştır
     task_strategy = asyncio.create_task(strategy_runner.start())
     background_tasks.add(task_strategy)
@@ -212,6 +215,7 @@ async def lifespan(app: FastAPI):
     if binance_client:
         await binance_client.close()
 
+    await notifier.close()
     logger.info("Sistem başarıyla ve güvenle kapatıldı.")
     await db.close()
 

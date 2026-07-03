@@ -64,6 +64,33 @@ class AtlantisStrategyRunner:
         self.trade_state = TradeState()  # Durum hafızası
         logger.info("🛠️ Atlantis İndikatör Matematiği ve Durum Hafızası belleğe yüklendi.")
 
+    async def restore_state_from_db(self):
+        """Sunucu yeniden başlatıldığında açık pozisyonları RAM durumuna geri yükler."""
+        if not db.pool:
+            logger.warning("🔄 DB bağlı değil; state recovery atlandı.")
+            return
+
+        logger.info("🔄 Açık pozisyonlar veritabanından RAM'e restore ediliyor...")
+        open_trades = await db.get_all_open_trades()
+        restored_count = 0
+
+        for trade in open_trades:
+            symbol = trade['symbol']
+            state_dict = self.trade_state.get_state(symbol)
+            state_dict['in_position'] = True
+            state_dict['side'] = trade['side']
+            state_dict['entry_price'] = trade['entry_price']
+            state_dict['size'] = trade['size']
+            state_dict['tp_taken'] = bool(trade.get('tp_taken', False))
+            state_dict['strategy_type'] = trade.get('strategy_type', 'UNKNOWN')
+            restored_count += 1
+            logger.info(
+                f"[{symbol}] 💾 State restore edildi: side={state_dict['side']} size={state_dict['size']} "
+                f"tp_taken={state_dict['tp_taken']} strategy={state_dict['strategy_type']}"
+            )
+
+        logger.info(f"✅ {restored_count} açık pozisyon RAM'e restore edildi.")
+
     async def _scan_market_for_symbol(self, symbol: str):
         # CCXT için orijinal format (örn. "SOL/USDT"), lock/state için normalize (örn. "SOLUSDT")
         sym_ccxt = symbol  # CCXT "SOL/USDT" formatını bekler
@@ -254,7 +281,8 @@ class AtlantisStrategyRunner:
                             stop_price = current_price - atr_stop_dist
                             success = await self.execution_engine.execute_trade(
                                 symbol=sym_key, side="LONG", margin_usdt=margin_usdt, 
-                                leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price
+                                leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price,
+                                strategy_type=strategy_type
                             )
                             if success:
                                 # State'i güncelle
@@ -279,7 +307,8 @@ class AtlantisStrategyRunner:
                             stop_price = current_price + atr_stop_dist
                             success = await self.execution_engine.execute_trade(
                                 symbol=sym_key, side="SHORT", margin_usdt=margin_usdt, 
-                                leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price
+                                leverage=config.LEVERAGE, entry_price=current_price, stop_price=stop_price,
+                                strategy_type=strategy_type
                             )
                             if success:
                                 # State'i güncelle

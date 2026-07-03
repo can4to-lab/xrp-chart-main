@@ -24,7 +24,7 @@ class ExecutionEngine:
                     return f"{base}/{quote}"
         return symbol
 
-    async def execute_trade(self, symbol: str, side: str, margin_usdt: float, leverage: int, entry_price: float, stop_price: float) -> bool:
+    async def execute_trade(self, symbol: str, side: str, margin_usdt: float, leverage: int, entry_price: float, stop_price: float, strategy_type: str = 'UNKNOWN') -> bool:
         try:
             sym_ccxt = self._to_ccxt_symbol(symbol)
             is_setup = await self.client.setup_margin_and_leverage(sym_ccxt, leverage)
@@ -64,7 +64,8 @@ class ExecutionEngine:
             # 3. VERITABANINA KAYDET (Stop emrinden ONCE kaydet - islem havada kalmasin)
             trade_id = await db.insert_trade(
                 symbol=symbol, side=side, leverage=leverage, 
-                size=actual_filled_size, entry_price=actual_entry_price, stop_price=formatted_stop_price
+                size=actual_filled_size, entry_price=actual_entry_price, stop_price=formatted_stop_price,
+                strategy_type=strategy_type
             )
             if trade_id:
                 logger.info(f"[{symbol}] ✅ Islem DB'ye kaydedildi. (ID: {trade_id})")
@@ -243,40 +244,29 @@ class ExecutionEngine:
 
     async def move_stop_to_breakeven(self, symbol: str, side: str, entry_price: float):
         """
-        Stop loss'u giris fiyatina (break-even) tasir.
-        Order ID tabanli guvenli yonetim ve rollback mekanizmasi ile.
+        Stop loss'u giriş fiyatına (break-even) taşır.
+        ATOMİK (Cancel & Replace) metodu ile milisaniyelik riskleri (naked window) sıfırlar.
         """
         try:
             sym_ccxt = self._to_ccxt_symbol(symbol)
-            # 1. Acik pozisyonu kontrol et
+            
+            # 1. Açık pozisyonu kontrol et ve ESKİ STOP ORDER ID'sini DB'den çek
             open_trade = await db.get_open_trade(symbol)
             if not open_trade:
-                logger.warning(f"[{symbol}] Break-even stop icin acik pozisyon bulunamadi.")
+                logger.warning(f"[{symbol}] Break-even stop için açık pozisyon bulunamadı.")
                 return False
 
             position_size = open_trade['size']
-            old_stop_price = open_trade.get('stop_price')
             old_stop_order_id = open_trade.get('stop_order_id')
             
-            # 2. Binance'daki aktif stop emirlerini bul
-            open_orders = await self.exchange.fetch_open_orders(sym_ccxt)
-            stop_orders = [order for order in open_orders if order['type'] == 'stop_market']
-            
-            # 3. Eki stop emirlerini teker teker iptal et
-            cancelled_order_ids = []
-            for order in stop_orders:
-                try:
-                    await self.exchange.cancel_order(order['id'], sym_ccxt)
-                    cancelled_order_ids.append(order['id'])
-                    logger.info(f"[{symbol}] Eski stop emri iptal edildi: {order['id']}")
-                except Exception as cancel_err:
-                    logger.warning(f"[{symbol}] Stop emri {order['id']} iptal edilirken hata: {cancel_err}")
-                    # Iptal edilemeyen emirleri logla ama devam et
+            if not old_stop_order_id:
+                logger.error(f"[{symbol}] DB'de stop_order_id bulunamadı! Atomik güncelleme yapılamaz.")
+                return False
 
-            # 4. Yeni break-even stop fiyatini hesapla (ATR bazli)
+            # 2. Yeni break-even stop fiyatını hesapla (ATR bazlı)
             atr = await self._get_atr(sym_ccxt, period=14)
             if atr <= 0:
-                logger.error(f"[{symbol}] ATR hesaplanamadi, break-even stop kurulamiyor.")
+                logger.error(f"[{symbol}] ATR hesaplanamadı, break-even stop kurulamıyor.")
                 return False
             
             # ATR'ye gore break-even stop (entry'ye yakin ama volatiliteye uygun)
@@ -296,70 +286,50 @@ class ExecutionEngine:
             formatted_breakeven_stop = float(self.exchange.price_to_precision(sym_ccxt, breakeven_stop))
             stop_side = 'sell' if side == 'LONG' else 'buy'
 
-            # 5. Yeni break-even stop emrini gonder
+            # 3. ATOMİK GÜNCELLEME (Cancel & Replace) - Eski 3. ve 5. adımların birleşimi
             new_stop_order_id = None
             try:
-                new_stop_order = await self.exchange.create_order(
-                    symbol=sym_ccxt, 
-                    type='stop_market', 
-                    side=stop_side, 
+                # CCXT edit_order Binance'te PUT /fapi/v1/order endpoint'ini tetikler
+                updated_order = await self.exchange.edit_order(
+                    id=old_stop_order_id,
+                    symbol=sym_ccxt,
+                    type='stop_market',
+                    side=stop_side,
                     amount=position_size,
                     params={
-                        'stopPrice': formatted_breakeven_stop, 
-                        'reduceOnly': True,
-                        'timeInForce': 'GTC'  # Good Till Cancel
+                        'stopPrice': formatted_breakeven_stop,
+                        'reduceOnly': True
                     }
                 )
-                new_stop_order_id = new_stop_order.get('id')
-                logger.info(f"[{symbol}] ✅ Yeni break-even stop emri gonderildi: {formatted_breakeven_stop} (Order ID: {new_stop_order_id})")
                 
-            except Exception as new_stop_err:
-                logger.critical(f"[{symbol}] ⚠️ Yeni stop emri basarisiz! Rollback gerekli. Hata: {new_stop_err}")
+                # Binance düzenlenmiş emre yeni bir ID atar, onu almalıyız
+                new_stop_order_id = updated_order.get('id')
+                logger.info(f"[{symbol}] ✅ Atomik Güncelleme Başarılı! Eski Stop: {old_stop_order_id} -> Yeni Stop: {formatted_breakeven_stop} (Yeni ID: {new_stop_order_id})")
                 
-                # ROLLBACK: Eski stop'u geri yüklemeye çalış
-                if old_stop_price and old_stop_order_id:
-                    try:
-                        # Eski stop emri zaten iptal edildi, yenisini olustur
-                        # reduceOnly olmadan dene - limit hatasini onlemek icin
-                        await self.exchange.create_order(
-                            symbol=sym_ccxt,
-                            type='stop_market',
-                            side=stop_side,
-                            amount=position_size,
-                            params={
-                                'stopPrice': old_stop_price
-                            }
-                        )
-                        logger.warning(f"[{symbol}] 🔄 Rollback: Eski stop geri yüklendi: {old_stop_price}")
-                    except Exception as rollback_err:
-                        logger.critical(f"[{symbol}] 🚨 Rollback basarisiz! Manuel mudahale gerekli: {rollback_err}")
-                        await notifier.send_message(
-                            f"🚨 <b>ACIL DURUM:</b> {symbol} icin stop loss yok!\n"
-                            f"Yon: {side}\n"
-                            f"Boyut: {position_size}\n"
-                            f"MANUEL MUDAHALE GEREKLI!"
-                        )
-                
+            except Exception as edit_err:
+                # Atomik işlem başarısız olduysa ESKİ EMİR HALA GEÇERLİDİR. 
+                # Rollback (Geri sarma) kodlarına artık gerek yok! Çıplak (naked) kalmadık.
+                logger.error(f"[{symbol}] ⚠️ Atomik Cancel&Replace başarısız oldu! Eski stop emri ({old_stop_order_id}) hala devrede koruma sağlıyor. Hata: {edit_err}")
                 return False
 
-            # 6. Veritabanini güncelle (yeni stop fiyati ve order ID)
+            # 4. Veritabanını güncelle (yeni stop fiyatı ve YENİ order ID ile)
             await db.update_trade_stop(symbol, formatted_breakeven_stop, new_stop_order_id)
             
-            # 7. Telegram'a bildir
+            # 5. Telegram'a bildir
             alert_msg = (
-                f"🛡️ <b>STOP LOSS BREAK-EVEN'A CEKILDI</b>\n\n"
+                f"🛡️ <b>STOP LOSS BREAK-EVEN'A ÇEKİLDİ (ATOMİK)</b>\n\n"
                 f"📌 <b>Parite:</b> {symbol}\n"
-                f"🎯 <b>Yon:</b> {side}\n"
-                f"💰 <b>Giris Fiyati:</b> {entry_price:.4f}\n"
+                f"🎯 <b>Yön:</b> {side}\n"
+                f"💰 <b>Giriş Fiyatı:</b> {entry_price:.4f}\n"
                 f"🛡️ <b>Yeni Stop:</b> {formatted_breakeven_stop:.4f}\n"
-                f"✅ <b>Durum:</b> Risksiz surus (Free Ride) aktif!"
+                f"✅ <b>Durum:</b> Risksiz sürüş (Free Ride) aktif!"
             )
             await notifier.send_message(alert_msg)
             
             return True
 
         except Exception as e:
-            logger.error(f"[{symbol}] Break-even stop ayarlama hatasi: {str(e)}")
+            logger.error(f"[{symbol}] Break-even stop ayarlama hatası: {str(e)}")
             return False
 
     async def _get_atr(self, symbol: str, period: int = 14) -> float:
