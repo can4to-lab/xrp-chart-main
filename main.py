@@ -35,12 +35,19 @@ async def reconcile_system_state(client: BinanceFuturesClient, symbols: list):
     """
     Sistem Başlangıç Mutabakatı (Self-Healing / Reconciliation Loop)
     Veritabanı (SSOT) ile Binance Futures üzerindeki gerçek durumu eşleştirir ve onarır.
+    API down ise graceful degradation - reconciliation skip edilir.
     """
     logger.info("🔄 Sistem Mutabakatı (Reconciliation) başlatılıyor...")
     try:
         # 1. Borsadaki aktif pozisyonları çek (contracts > 0 olanlar)
-        await client.exchange.load_markets()
-        raw_positions = await client.exchange.fetch_positions(symbols)
+        try:
+            await client.exchange.load_markets()
+            raw_positions = await client.exchange.fetch_positions(symbols)
+        except Exception as api_err:
+            # API down ise (502, timeout vb), reconciliation'ı skip et
+            logger.warning(f"⚠️ Reconciliation: Binance API erişilemedi ({type(api_err).__name__}). Başlangıç mutabakatı skip edildi.")
+            logger.info("✅ Bot yine de başlatılıyor - API online olduktan sonra sonraki scan'de senkronize olacak.")
+            return
         binance_positions = {}
 
         for pos in raw_positions:

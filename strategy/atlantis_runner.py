@@ -70,11 +70,33 @@ class AtlantisStrategyRunner:
         sym_key = symbol.replace("/", "").upper()  # Lock/state anahtarı
         lock = state.get_symbol_lock(sym_key) # Sembole özel kilit alınıyor
         logger.info(f"[{sym_key}] 🔍 {self.timeframe} periyotlu piyasa taraması başlatıldı.")
+        
+        # Exponential backoff değişkenleri
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        base_delay = 2.0
+        max_delay = 120.0
 
         while self._running:
             try:
                 # 1. Veri Çekme Aşaması (Lock Dışında - API istekleri kilidi bloklamasın)
-                ohlcv = await self.client.exchange.fetch_ohlcv(sym_ccxt, timeframe=self.timeframe, limit=200)
+                # Exponential backoff ile retry
+                try:
+                    ohlcv = await self.client.fetch_ohlcv_with_retry(sym_ccxt, timeframe=self.timeframe, limit=200)
+                    consecutive_errors = 0  # Başarılı çağrıda hata sayacını sıfırla
+                except Exception as fetch_err:
+                    consecutive_errors += 1
+                    delay = min(base_delay * (2 ** consecutive_errors), max_delay)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"[{sym_key}] ❌ API {max_consecutive_errors} kez başarısız oldu. "
+                                   f"{delay:.0f}s bekleniyor sonra retry... (Hata: {type(fetch_err).__name__})")
+                    else:
+                        logger.warning(f"[{sym_key}] ⚠️ API çağrısı başarısız (Deneme {consecutive_errors}/{max_consecutive_errors}). "
+                                     f"{delay:.0f}s sonra retry... (Hata: {type(fetch_err).__name__})")
+                    
+                    await asyncio.sleep(delay)
+                    continue  # Sonraki iterasyona geç
 
                 if not ohlcv or len(ohlcv) < 150:
                     await asyncio.sleep(5)

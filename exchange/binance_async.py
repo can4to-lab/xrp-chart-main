@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class BinanceFuturesClient:
-    """Binance USDT-M Vadeli İşlemler asenkron bağlantı katmanı."""
+    """Binance USDT-M Vadeli İşlemler asenkron bağlantı katmanı. Retry ve exponential backoff desteklenir."""
 
     def __init__(self, api_key: str, secret_key: str, testnet: bool = False):
         self.exchange = ccxt.binance({
@@ -29,6 +29,35 @@ class BinanceFuturesClient:
         else:
             logger.warning(
                 "DIKKAT: Binance Futures GERCEK hesapta baslatildi!")
+
+    async def _retry_with_backoff(self, coro_func, max_retries: int = 3, initial_delay: float = 1.0, max_delay: float = 30.0):
+        """
+        Exponential backoff ile retry mekanizması.
+        max_retries: Maksimum retry sayısı
+        initial_delay: İlk retry arası bekleme süresi (saniye)
+        max_delay: Maksimum bekleme süresi
+        """
+        delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                return await coro_func()
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ API çağrısı retry {attempt + 1}/{max_retries} (Bekleme: {delay}s): {type(e).__name__}")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)  # Exponential backoff (max_delay'e kadar)
+                else:
+                    logger.error(f"❌ API çağrısı başarısız (son deneme): {str(e)}")
+                    raise
+
+    async def fetch_ohlcv_with_retry(self, symbol: str, timeframe: str = '1h', limit: int = 100):
+        """OHLCV verilerini exponential backoff ile retry yaparak çek."""
+        return await self._retry_with_backoff(
+            lambda: self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
+            max_retries=3,
+            initial_delay=2.0,
+            max_delay=10.0
+        )
 
     async def setup_margin_and_leverage(self, symbol: str, leverage: int, margin_type: str = 'ISOLATED') -> bool:
         """İşlem öncesi sembol için Kaldıraç ve Marjin tipini ayarlar. Retry mekanizması ve delay içerir."""
