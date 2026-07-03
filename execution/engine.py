@@ -62,11 +62,14 @@ class ExecutionEngine:
                 logger.warning(f"[{symbol}] Emirler iptal edilirken uyari: {cancel_err}")
 
             # 3. VERITABANINA KAYDET (Stop emrinden ONCE kaydet - islem havada kalmasin)
-            await db.insert_trade(
+            trade_id = await db.insert_trade(
                 symbol=symbol, side=side, leverage=leverage, 
                 size=actual_filled_size, entry_price=actual_entry_price, stop_price=formatted_stop_price
             )
-            logger.info(f"[{symbol}] ✅ Islem DB'ye kaydedildi.")
+            if trade_id:
+                logger.info(f"[{symbol}] ✅ Islem DB'ye kaydedildi. (ID: {trade_id})")
+            else:
+                logger.warning(f"[{symbol}] ⚠️ Islem DB'ye kaydedilemedi - DATABASE_URL veya bağlantı yok.")
 
             try:
                 stop_order = await self.exchange.create_order(
@@ -78,8 +81,11 @@ class ExecutionEngine:
                 
                 # Stop emri basarili olunca order ID'yi DB'ye kaydet
                 if stop_order_id:
-                    await db.update_trade_stop(symbol, formatted_stop_price, stop_order_id)
-                    logger.info(f"[{symbol}] ✅ Stop emri DB'ye kaydedildi.")
+                    if getattr(db, 'pool', None):
+                        await db.update_trade_stop(symbol, formatted_stop_price, stop_order_id)
+                        logger.info(f"[{symbol}] ✅ Stop emri DB'ye kaydedildi.")
+                    else:
+                        logger.warning(f"[{symbol}] ⚠️ Stop emri DB'ye kaydedilemedi - DATABASE_URL veya bağlantı yok.")
                 
             except Exception as sl_err:
                 logger.critical(f"[{symbol}] ⚠️ Stop Loss emri basarisiz! Pozisyon ACIL kapatiliyor (Rollback). Hata: {sl_err}")
@@ -197,11 +203,13 @@ class ExecutionEngine:
                 # DB'deki boyutu güncelle (update_trade_stop kullanarak)
                 await db.update_trade_stop(symbol, open_trade['stop_price'], open_trade.get('stop_order_id'))
                 # Boyutu güncellemek için özel sorgu
-                if open_trade.get('stop_order_id'):
+                if open_trade.get('stop_order_id') and getattr(db, 'pool', None):
                     query = "UPDATE trades SET size = $1 WHERE symbol = $2 AND status = 'OPEN'"
                     async with db.pool.acquire() as conn:
                         await conn.execute(query, remaining_size, symbol)
-                logger.info(f"[{symbol}] ✅ Kalan pozisyon boyutu DB'ye kaydedildi: {remaining_size}")
+                    logger.info(f"[{symbol}] ✅ Kalan pozisyon boyutu DB'ye kaydedildi: {remaining_size}")
+                else:
+                    logger.warning(f"[{symbol}] ⚠️ Kalan pozisyon boyutu DB'ye kaydedilemedi - DATABASE_URL veya bağlantı yok.")
                 
                 # Telegram'a kısmi kapatma bildirimi
                 partial_msg = (
