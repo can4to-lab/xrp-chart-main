@@ -228,43 +228,42 @@ class AtlantisStrategyRunner:
                             await asyncio.sleep(10)
                             continue
 
+                        # --- DİNAMİK ROE (KÂRLILIK) HESAPLAMA ---
+                        unrealized_roe = 0.0
+                        if current_state['side'] == 'LONG':
+                            unrealized_roe = ((current_price - current_state['entry_price']) / current_state['entry_price']) * 100 * config.LEVERAGE
+                        elif current_state['side'] == 'SHORT':
+                            unrealized_roe = ((current_state['entry_price'] - current_price) / current_state['entry_price']) * 100 * config.LEVERAGE
+
                         # --- 2. KÂRI KORU (TP SİNYALİ KONTROLÜ) ---
-                        # Sadece daha önce TP alınmamışsa ve hala pozisyondaysak
                         if not current_state['tp_taken']:
-                            if long_tp_signal and current_state['side'] == 'LONG':
-                                logger.warning(f"[{sym_key}] 💰 LONG TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
-                                # Pozisyonun yarısını sat
+                            # İndikatör Sinyali VEYA Kasa %15 Kârı gördüyse Affetme!
+                            if (long_tp_signal or unrealized_roe >= 15.0) and current_state['side'] == 'LONG':
+                                logger.warning(f"[{sym_key}] 💰 LONG TP VAKTİ! (Kâr: %{unrealized_roe:.2f}). %50 pozisyon kapatılıyor...")
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_key, side='LONG', size=half_size, reason="LONG TP (Trend Yoruldu)"
+                                    symbol=sym_key, side='LONG', size=half_size, reason="LONG TP (Kâr Realizasyonu)"
                                 )
-                                # Stop loss'u break-even'a çek
                                 await self.execution_engine.move_stop_to_breakeven(
                                     symbol=sym_key, side='LONG', entry_price=current_state['entry_price']
                                 )
-                                # TP bayrağını işaretle
                                 self.trade_state.set_tp_taken(sym_key)
-                                # State'deki boyutu güncelle (kalan %50)
-                                current_state['size'] = half_size
-                                await asyncio.sleep(10)
+                                current_state['size'] -= half_size
+                                await asyncio.sleep(5)
                                 continue
                                 
-                            elif short_tp_signal and current_state['side'] == 'SHORT':
-                                logger.warning(f"[{sym_key}] 💰 SHORT TP SİNYALİ! (Trend Yoruldu). %50 kâr alınıyor...")
-                                # Pozisyonun yarısını sat
+                            elif (short_tp_signal or unrealized_roe >= 15.0) and current_state['side'] == 'SHORT':
+                                logger.warning(f"[{sym_key}] 💰 SHORT TP VAKTİ! (Kâr: %{unrealized_roe:.2f}). %50 pozisyon kapatılıyor...")
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_key, side='SHORT', size=half_size, reason="SHORT TP (Trend Yoruldu)"
+                                    symbol=sym_key, side='SHORT', size=half_size, reason="SHORT TP (Kâr Realizasyonu)"
                                 )
-                                # Stop loss'u break-even'a çek
                                 await self.execution_engine.move_stop_to_breakeven(
                                     symbol=sym_key, side='SHORT', entry_price=current_state['entry_price']
                                 )
-                                # TP bayrağını işaretle
                                 self.trade_state.set_tp_taken(sym_key)
-                                # State'deki boyutu güncelle (kalan %50)
-                                current_state['size'] = half_size
-                                await asyncio.sleep(10)
+                                current_state['size'] -= half_size
+                                await asyncio.sleep(5)
                                 continue
 
                         # Zaten bir işlemdeysek ve çıkış/TP sinyali de yoksa, yeni girişleri yok say ve bekle

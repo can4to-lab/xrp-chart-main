@@ -481,23 +481,27 @@ class AtlantisIndicator:
             (df['short_exit_trend'] & (df['strategy_type'] == 'TREND'))
         )
 
-        # ========== TP SİNYALLERİ (Mevcut sistem korundu) ==========
-        df['adx_fatigue'] = df['adx'] > 40
+        # ========== YENİ NESİL TP SİNYALLERİ ==========
+        # 1. ADX yorulma eşiği 40'tan 30'a çekildi (Gerçekçi piyasa normu)
+        df['adx_fatigue'] = df['adx'] > 30
         
-        # TP sinyali için is_3_green/is_3_red sütunlarını güvenli şekilde kontrol et
+        # 2. RSI Momentum Yorulması (Aşırı Alım/Satım tepeleri)
+        df['long_momentum_fatigue'] = df['rsi'] >= 75
+        df['short_momentum_fatigue'] = df['rsi'] <= 25
+        
         has_3_green = 'is_3_green' in df.columns
         has_3_red = 'is_3_red' in df.columns
         
+        # LONG TP: Trend yorulduysa VEYA fiyat çok hızlı şişip RSI'ı patlattıysa kâr al!
         df['long_tp_signal'] = (
-            df['adx_fatigue'] &
-            df['minus_di_cross'] &
-            (df['trend_bullish'] | (df['is_3_green'] if has_3_green else False))
+            (df['adx_fatigue'] & df['minus_di_cross']) | 
+            df['long_momentum_fatigue']
         )
         
+        # SHORT TP: Trend yorulduysa VEYA fiyat çok sert çöküp RSI'ı dip yaptırdıysa kâr al!
         df['short_tp_signal'] = (
-            df['adx_fatigue'] &
-            df['plus_di_cross'] &
-            (df['trend_bearish'] | (df['is_3_red'] if has_3_red else False))
+            (df['adx_fatigue'] & df['plus_di_cross']) | 
+            df['short_momentum_fatigue']
         )
 
         return df
