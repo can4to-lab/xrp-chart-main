@@ -101,7 +101,9 @@ class ExecutionEngine:
                             current_position = pos
                             break
                     
-                    if current_position and float(current_position.get('size', 0)) > 0:
+                    pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
+                    
+                    if current_position and abs(pos_contracts) > 0:
                         # Pozisyon var, kapat
                         await self.exchange.create_order(
                             symbol=sym_ccxt, type='market', side=stop_side, amount=actual_filled_size
@@ -159,7 +161,9 @@ class ExecutionEngine:
                         current_position = pos
                         break
                 
-                if current_position and float(current_position.get('size', 0)) > 0:
+                pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
+                
+                if current_position and abs(pos_contracts) > 0:
                     # Pozisyon var, kapat
                     close_order = await self.exchange.create_order(
                         symbol=sym_ccxt, type='market', side=close_side, amount=formatted_size,
