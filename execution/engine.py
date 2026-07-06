@@ -100,7 +100,8 @@ class ExecutionEngine:
                     
                     current_position = None
                     for pos in positions:
-                        if pos and pos.get('symbol') == sym_ccxt:  # pos kontrolü ekle
+                        pos_sym = pos.get('symbol', '').split(':')[0]
+                        if pos_sym == sym_ccxt:
                             current_position = pos
                             break
                     
@@ -166,7 +167,8 @@ class ExecutionEngine:
                 
                 current_position = None
                 for pos in positions:
-                    if pos and pos.get('symbol') == sym_ccxt:  # pos kontrolü ekle
+                    pos_sym = pos.get('symbol', '').split(':')[0] 
+                    if pos_sym == sym_ccxt:
                         current_position = pos
                         break
                 
