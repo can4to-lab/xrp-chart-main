@@ -64,6 +64,38 @@ class AtlantisStrategyRunner:
         self.trade_state = TradeState()  # Durum hafızası
         logger.info("🛠️ Atlantis İndikatör Matematiği ve Durum Hafızası belleğe yüklendi.")
 
+    def _get_bool_signal(self, row, key: str, default: bool = False) -> bool:
+        """Eksik sütunlarda hata vermeden güvenli bool sinyali döndürür."""
+        try:
+            if isinstance(row, pd.Series):
+                if key in row.index and row[key] is not None and not pd.isna(row[key]):
+                    return bool(row[key])
+                return default
+            if isinstance(row, dict):
+                value = row.get(key, default)
+                if value is None or pd.isna(value):
+                    return default
+                return bool(value)
+        except Exception:
+            return default
+        return default
+
+    def _get_numeric_signal(self, row, key: str, default: float = 0.0) -> float:
+        """Eksik sütunlarda hata vermeden güvenli numeric sinyali döndürür."""
+        try:
+            if isinstance(row, pd.Series):
+                if key in row.index and row[key] is not None and not pd.isna(row[key]):
+                    return float(row[key])
+                return float(default)
+            if isinstance(row, dict):
+                value = row.get(key, default)
+                if value is None or pd.isna(value):
+                    return float(default)
+                return float(value)
+        except Exception:
+            return float(default)
+        return float(default)
+
     async def restore_state_from_db(self):
         """Sunucu yeniden başlatıldığında açık pozisyonları RAM durumuna geri yükler."""
         if not db.pool:
@@ -132,26 +164,51 @@ class AtlantisStrategyRunner:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_signals = self.indicator.get_signals(df)
 
+                if df_signals is None or df_signals.empty or len(df_signals) < 2:
+                    logger.warning(f"[{sym_key}] ⚠️ Sinyal DataFrame'i boş veya yetersiz; sonraki tur bekleniyor.")
+                    await asyncio.sleep(5)
+                    continue
+
+                # Gerekli sütunlar eksikse güvenli varsayılanlarla doldur
+                for col, default in {
+                    'regime': 'UNKNOWN',
+                    'strategy_type': 'NONE',
+                    'long_signal': False,
+                    'short_signal': False,
+                    'long_exit': False,
+                    'short_exit': False,
+                    'long_tp_signal': False,
+                    'short_tp_signal': False,
+                    'atr_stop_dist': 0.0,
+                    'close': 0.0,
+                    'adx': 0.0,
+                    'rsi': 0.0,
+                    'vol_sma': 0.0,
+                    'volume': 0.0,
+                }.items():
+                    if col not in df_signals.columns:
+                        df_signals[col] = default
+
                 last_closed_candle = df_signals.iloc[-2]
                 last_candle = df_signals.iloc[-1]
-                current_price = last_candle['close']
+                current_price = self._get_numeric_signal(last_candle, 'close', 0.0)
 
                 # Yeni rejim değişimli sinyaller
-                regime = str(last_closed_candle.get('regime', 'UNKNOWN'))
-                strategy_type = str(last_closed_candle.get('strategy_type', 'NONE'))
-                long_signal = bool(last_closed_candle['long_signal'])
-                short_signal = bool(last_closed_candle['short_signal'])
-                long_exit = bool(last_closed_candle['long_exit'])
-                short_exit = bool(last_closed_candle['short_exit'])
-                long_tp_signal = bool(last_closed_candle['long_tp_signal'])
-                short_tp_signal = bool(last_closed_candle['short_tp_signal'])
-                atr_stop_dist = float(last_closed_candle['atr_stop_dist'])
+                regime = str(last_closed_candle.get('regime', 'UNKNOWN')) if isinstance(last_closed_candle, dict) else str(last_closed_candle['regime'])
+                strategy_type = str(last_closed_candle.get('strategy_type', 'NONE')) if isinstance(last_closed_candle, dict) else str(last_closed_candle['strategy_type'])
+                long_signal = self._get_bool_signal(last_closed_candle, 'long_signal')
+                short_signal = self._get_bool_signal(last_closed_candle, 'short_signal')
+                long_exit = self._get_bool_signal(last_closed_candle, 'long_exit')
+                short_exit = self._get_bool_signal(last_closed_candle, 'short_exit')
+                long_tp_signal = self._get_bool_signal(last_closed_candle, 'long_tp_signal')
+                short_tp_signal = self._get_bool_signal(last_closed_candle, 'short_tp_signal')
+                atr_stop_dist = self._get_numeric_signal(last_closed_candle, 'atr_stop_dist', 0.0)
 
                 # --- 📊 METRİK HESAPLAMALARI (en güncel mumdan) ---
-                adx_val = last_candle.get('adx', 0)
-                rsi_val = last_candle.get('rsi', 0)
-                vol_sma = last_candle.get('vol_sma', 0)
-                vol_ratio = (last_candle['volume'] / vol_sma) * 100 if vol_sma > 0 else 0
+                adx_val = self._get_numeric_signal(last_candle, 'adx', 0.0)
+                rsi_val = self._get_numeric_signal(last_candle, 'rsi', 0.0)
+                vol_sma = self._get_numeric_signal(last_candle, 'vol_sma', 0.0)
+                vol_ratio = (self._get_numeric_signal(last_candle, 'volume', 0.0) / vol_sma) * 100 if vol_sma > 0 else 0
 
                 # 1. Rejim ve Strateji Bilgisini Belirle
                 if adx_val < 20:

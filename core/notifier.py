@@ -12,6 +12,10 @@ class TelegramNotifier:
         self.chat_ids = [cid.strip() for cid in raw_chat_id.split(',')] if raw_chat_id else []
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
 
+    async def close(self):
+        """Uygulama kapanırken notifier kaynaklarını güvenli şekilde bırakır."""
+        return None
+
     async def send_message(self, message: str):
         if not self.bot_token or not self.chat_ids:
             return
