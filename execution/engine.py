@@ -95,9 +95,12 @@ class ExecutionEngine:
                 try:
                     # Once pozisyonu kontrol et
                     positions = await self.exchange.fetch_positions([sym_ccxt])
+                    if not positions:
+                        positions = []  # None döndüyse boş liste yap
+                    
                     current_position = None
                     for pos in positions:
-                        if pos['symbol'] == sym_ccxt:
+                        if pos and pos.get('symbol') == sym_ccxt:  # pos kontrolü ekle
                             current_position = pos
                             break
                     
@@ -155,11 +158,15 @@ class ExecutionEngine:
 
             # 1. Borsadan Pozisyonu Kapat
             # Once pozisyonu kontrol et - reduceOnly kullanirken pozisyonun varligi kontrolu gerekir
+            close_order = None  # Başlangıçta None olarak tanımla
             try:
                 positions = await self.exchange.fetch_positions([sym_ccxt])
+                if not positions:
+                    positions = []  # None döndüyse boş liste yap
+                
                 current_position = None
                 for pos in positions:
-                    if pos['symbol'] == sym_ccxt:
+                    if pos and pos.get('symbol') == sym_ccxt:  # pos kontrolü ekle
                         current_position = pos
                         break
                 
@@ -175,9 +182,9 @@ class ExecutionEngine:
                     )
                 else:
                     # Pozisyon yok, sadece emirleri iptal et ve DB'yi senkronize etmeye devam et
-                    logger.warning(f"[{symbol}] close_position: Pozisyon zaten kapali, sadece emirler iptal ediliyor ve DB senkronize ediliyor.")
+                    logger.warning(f"[{symbol}] close_position: Pozisyon zaten kapali, sadece emirler iptal ediliyor.")
                     await self.exchange.cancel_all_orders(sym_ccxt)
-                    close_order = {}  # RETURN YOK! Aşağıdaki DB close_trade satırlarına akmaya devam etmeli.
+                    close_order = {}  # Boş dict ata, None olmasın
             except Exception as pos_err:
                 logger.error(f"[{symbol}] Pozisyon kontrol hatasi: {pos_err}")
                 return
@@ -190,7 +197,10 @@ class ExecutionEngine:
                 logger.warning(f"[{symbol}] Bekleyen emirler iptal edilirken uyari: {cancel_err}")
             
             # 3. Kapanis fiyatini ve PnL degerini hesapla
-            actual_close_price = float(close_order.get('average') or close_order.get('price') or None)
+            actual_close_price = 0.0
+            if close_order:
+                actual_close_price = float(close_order.get('average') or close_order.get('price') or 0.0)
+            
             if not actual_close_price or actual_close_price == 0.0:
                 ticker = await self.exchange.fetch_ticker(sym_ccxt)
                 actual_close_price = float(ticker.get('last', 0.0))
