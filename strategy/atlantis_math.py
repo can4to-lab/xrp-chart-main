@@ -457,18 +457,23 @@ class AtlantisIndicator:
         # Likidite avı sinyali varsa öncelik ver
         df.loc[df['liquidity_long_entry'] | df['liquidity_short_entry'], 'strategy_type'] = 'LIQUIDITY_SWEEP'
 
-        # ========== ÇIKIŞ SİNYALLERİ (Stratejiye Özel) ==========
-        # LONG çıkışları
+        # ========== ÇIKIŞ SİNYALLERİ (Rejimden Bağımsız) ==========
+        # Çıkışlar, girdikten sonra trendin bozulup bozulmadığını ölçer.
+        # Bu nedenle ADX/rejim durumu ne olursa olsun, DI kesişimi veya squeeze çözülmesi
+        # tetiklenirse pozisyon kapatılmalıdır.
         df['long_exit_bb'] = df['close'] > df['bb_middle']
         df['long_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] < 0)
         df['long_exit_trend'] = df['minus_di_cross']
-        
+
         # SHORT çıkışları
         df['short_exit_bb'] = df['close'] < df['bb_middle']
         df['short_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] > 0)
         df['short_exit_trend'] = df['plus_di_cross']
-        
-        
+
+        # Birleşik çıkış bayrakları: herhangi bir koşul tetiklenirse işlem kapatılır.
+        df['long_exit'] = df['long_exit_bb'] | df['long_exit_squeeze'] | df['long_exit_trend']
+        df['short_exit'] = df['short_exit_bb'] | df['short_exit_squeeze'] | df['short_exit_trend']
+
         # ========== YENİ NESİL TP SİNYALLERİ ==========
         # 1. ADX yorulma eşiği 40'tan 30'a çekildi (Gerçekçi piyasa normu)
         df['adx_fatigue'] = df['adx'] > 30
