@@ -75,7 +75,7 @@ class ExecutionEngine:
             try:
                 stop_order = await self.exchange.create_order(
                     symbol=sym_ccxt, type='stop_market', side=stop_side, amount=actual_filled_size,
-                    params={'stopPrice': formatted_stop_price, 'reduceOnly': True}
+                    params={'stopPrice': formatted_stop_price, 'triggerType': '4', 'reduceOnly': True}
                 )
                 stop_order_id = stop_order.get('id')
                 logger.info(f"[{symbol}] ✅ Isleme Girildi ve Stop Loss Yerelendi. (Order ID: {stop_order_id})")
@@ -101,9 +101,11 @@ class ExecutionEngine:
                             current_position = pos
                             break
                     
-                    pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
+                    pos_contracts = 0.0
+                    if current_position:
+                        pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
                     
-                    if current_position and abs(pos_contracts) > 0:
+                    if abs(pos_contracts) > 0:
                         # Pozisyon var, kapat
                         await self.exchange.create_order(
                             symbol=sym_ccxt, type='market', side=stop_side, amount=actual_filled_size
@@ -111,9 +113,9 @@ class ExecutionEngine:
                         logger.info(f"[{symbol}] Rollback: Pozisyon kapatildi.")
                     else:
                         logger.warning(f"[{symbol}] Rollback: Pozisyon zaten kapali.")
+                
                 except Exception as rollback_err:
                     logger.error(f"[{symbol}] Rollback hatasi: {rollback_err}")
-                
                 # DB'de islemi kapatildi olarak isaretle
                 try:
                     ticker = await self.exchange.fetch_ticker(sym_ccxt)
@@ -161,19 +163,21 @@ class ExecutionEngine:
                         current_position = pos
                         break
                 
-                pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
+                pos_contracts = 0.0
+                if current_position:
+                    pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
                 
-                if current_position and abs(pos_contracts) > 0:
+                if abs(pos_contracts) > 0:
                     # Pozisyon var, kapat
                     close_order = await self.exchange.create_order(
                         symbol=sym_ccxt, type='market', side=close_side, amount=formatted_size,
                         params={'reduceOnly': True}
                     )
                 else:
-                    # Pozisyon yok, sadece emirleri iptal et
-                    logger.warning(f"[{symbol}] close_position: Pozisyon zaten kapali, sadece emirler iptal ediliyor.")
+                    # Pozisyon yok, sadece emirleri iptal et ve DB'yi senkronize etmeye devam et
+                    logger.warning(f"[{symbol}] close_position: Pozisyon zaten kapali, sadece emirler iptal ediliyor ve DB senkronize ediliyor.")
                     await self.exchange.cancel_all_orders(sym_ccxt)
-                    return
+                    close_order = {}  # RETURN YOK! Aşağıdaki DB close_trade satırlarına akmaya devam etmeli.
             except Exception as pos_err:
                 logger.error(f"[{symbol}] Pozisyon kontrol hatasi: {pos_err}")
                 return
@@ -186,8 +190,8 @@ class ExecutionEngine:
                 logger.warning(f"[{symbol}] Bekleyen emirler iptal edilirken uyari: {cancel_err}")
             
             # 3. Kapanis fiyatini ve PnL degerini hesapla
-            actual_close_price = float(close_order.get('average') or close_order.get('price') or 0.0)
-            if actual_close_price == 0.0:
+            actual_close_price = float(close_order.get('average') or close_order.get('price') or None)
+            if not actual_close_price or actual_close_price == 0.0:
                 ticker = await self.exchange.fetch_ticker(sym_ccxt)
                 actual_close_price = float(ticker.get('last', 0.0))
 
@@ -302,6 +306,7 @@ class ExecutionEngine:
                     amount=position_size,
                     params={
                         'stopPrice': formatted_breakeven_stop,
+                        'triggerType': '4',
                         'reduceOnly': True
                     }
                 )
