@@ -194,27 +194,24 @@ class AtlantisStrategyRunner:
   
                     # --- 1. HAYATTA KAL (ÇIKIŞ SİNYALİ KONTROLÜ) ---
                     if current_state['in_position']:
-                        # Stratejiye özel çıkış sinyali
                         exit_reason = None
-                        if long_exit and current_state['side'] == 'LONG':
-                            if current_state['strategy_type'] == 'MEAN_REVERSION':
+                        strat_type = current_state['strategy_type']
+                        
+                        if current_state['side'] == 'LONG':
+                            if strat_type == 'MEAN_REVERSION' and bool(last_closed_candle.get('long_exit_bb', False)):
                                 exit_reason = "LONG EXIT (Bollinger Orta Bandı)"
-                            elif current_state['strategy_type'] == 'SQUEEZE':
+                            elif strat_type == 'SQUEEZE' and bool(last_closed_candle.get('long_exit_squeeze', False)):
                                 exit_reason = "LONG EXIT (Squeeze Bitti)"
-                            elif current_state['strategy_type'] == 'TREND':
+                            elif strat_type == 'TREND' and bool(last_closed_candle.get('long_exit_trend', False)):
                                 exit_reason = "LONG EXIT (DI Kesişimi)"
-                            else:
-                                exit_reason = "LONG EXIT SİNYALİ"
                                 
-                        elif short_exit and current_state['side'] == 'SHORT':
-                            if current_state['strategy_type'] == 'MEAN_REVERSION':
+                        elif current_state['side'] == 'SHORT':
+                            if strat_type == 'MEAN_REVERSION' and bool(last_closed_candle.get('short_exit_bb', False)):
                                 exit_reason = "SHORT EXIT (Bollinger Orta Bandı)"
-                            elif current_state['strategy_type'] == 'SQUEEZE':
+                            elif strat_type == 'SQUEEZE' and bool(last_closed_candle.get('short_exit_squeeze', False)):
                                 exit_reason = "SHORT EXIT (Squeeze Bitti)"
-                            elif current_state['strategy_type'] == 'TREND':
+                            elif strat_type == 'TREND' and bool(last_closed_candle.get('short_exit_trend', False)):
                                 exit_reason = "SHORT EXIT (DI Kesişimi)"
-                            else:
-                                exit_reason = "SHORT EXIT SİNYALİ"
                         
                         if exit_reason:
                             logger.warning(f"[{sym_key}] ⚠️ {exit_reason}! Kalan pozisyon kapatılıyor...")
