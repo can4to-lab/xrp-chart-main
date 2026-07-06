@@ -459,28 +459,16 @@ class AtlantisIndicator:
 
         # ========== ÇIKIŞ SİNYALLERİ (Stratejiye Özel) ==========
         # LONG çıkışları
-        df['long_exit_bb'] = (df['close'] > df['bb_middle']) & (df['regime'] == 'RANGE')  # Bollinger orta bandı
+        df['long_exit_bb'] = df['close'] > df['bb_middle']
         df['long_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] < 0)
-        df['long_exit_trend'] = df['minus_di_cross'] & (df['regime'] == 'TREND')  # DI kesişimi
+        df['long_exit_trend'] = df['minus_di_cross']
         
         # SHORT çıkışları
-        df['short_exit_bb'] = (df['close'] < df['bb_middle']) & (df['regime'] == 'RANGE')
+        df['short_exit_bb'] = df['close'] < df['bb_middle']
         df['short_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] > 0)
-        df['short_exit_trend'] = df['plus_di_cross'] & (df['regime'] == 'TREND')
+        df['short_exit_trend'] = df['plus_di_cross']
         
-        # Birleşik çıkış sinyalleri
-        df['long_exit'] = (
-            (df['long_exit_bb'] & (df['strategy_type'] == 'MEAN_REVERSION')) |
-            (df['long_exit_squeeze'] & (df['strategy_type'] == 'SQUEEZE')) |
-            (df['long_exit_trend'] & (df['strategy_type'] == 'TREND'))
-        )
         
-        df['short_exit'] = (
-            (df['short_exit_bb'] & (df['strategy_type'] == 'MEAN_REVERSION')) |
-            (df['short_exit_squeeze'] & (df['strategy_type'] == 'SQUEEZE')) |
-            (df['short_exit_trend'] & (df['strategy_type'] == 'TREND'))
-        )
-
         # ========== YENİ NESİL TP SİNYALLERİ ==========
         # 1. ADX yorulma eşiği 40'tan 30'a çekildi (Gerçekçi piyasa normu)
         df['adx_fatigue'] = df['adx'] > 30
