@@ -155,11 +155,11 @@ class ExecutionEngine:
             open_trade = await db.get_open_trade(symbol)
             
             close_side = 'sell' if side == 'LONG' else 'buy'
-            formatted_size = float(self.exchange.amount_to_precision(sym_ccxt, size))
 
             # 1. Borsadan Pozisyonu Kapat
             # Once pozisyonu kontrol et - reduceOnly kullanirken pozisyonun varligi kontrolu gerekir
             close_order = None  # Başlangıçta None olarak tanımla
+            size_to_close = abs(size)
             try:
                 positions = await self.exchange.fetch_positions([sym_ccxt])
                 if not positions:
@@ -175,8 +175,14 @@ class ExecutionEngine:
                 pos_contracts = 0.0
                 if current_position:
                     pos_contracts = float(current_position.get('contracts', 0.0) or current_position.get('positionAmt', 0.0) or 0.0)
+
+                is_full_close = bool(open_trade and abs(size) >= abs(open_trade['size']) - 1e-9)
+                if is_full_close and abs(pos_contracts) > 0:
+                    size_to_close = abs(pos_contracts)
+                    logger.info(f"[{symbol}] Tam kapatma için borsa pozisyon miktarı kullanılıyor: {size_to_close}")
                 
                 if abs(pos_contracts) > 0:
+                    formatted_size = float(self.exchange.amount_to_precision(sym_ccxt, size_to_close))
                     # Pozisyon var, kapat
                     close_order = await self.exchange.create_order(
                         symbol=sym_ccxt, type='market', side=close_side, amount=formatted_size,
@@ -210,7 +216,7 @@ class ExecutionEngine:
             pnl = 0.0
             if open_trade:
                 entry_price = open_trade['entry_price']
-                trade_size = open_trade['size']
+                trade_size = abs(size_to_close)
                 if side == 'LONG':
                     pnl = (actual_close_price - entry_price) * trade_size
                 else:
@@ -221,16 +227,9 @@ class ExecutionEngine:
                 # Kısmi kapatma - kalan boyutu DB'ye yaz
                 remaining_size = abs(open_trade['size']) - abs(size)
                 logger.info(f"[{symbol}] Kısmi kapatma: {abs(size)} satıldı, kalan: {remaining_size}")
-                # DB'deki boyutu güncelle (update_trade_stop kullanarak)
-                await db.update_trade_stop(symbol, open_trade['stop_price'], open_trade.get('stop_order_id'))
-                # Boyutu güncellemek için özel sorgu
-                if open_trade.get('stop_order_id') and getattr(db, 'pool', None):
-                    query = "UPDATE trades SET size = $1 WHERE symbol = $2 AND status = 'OPEN'"
-                    async with db.pool.acquire() as conn:
-                        await conn.execute(query, remaining_size, symbol)
-                    logger.info(f"[{symbol}] ✅ Kalan pozisyon boyutu DB'ye kaydedildi: {remaining_size}")
-                else:
-                    logger.warning(f"[{symbol}] ⚠️ Kalan pozisyon boyutu DB'ye kaydedilemedi - DATABASE_URL veya bağlantı yok.")
+                # Kısmi kapatma sonrası kalan boyutu ve kümülatif PnL'yi DB'ye yaz
+                await db.update_trade_after_partial_close(symbol, pnl, remaining_size)
+                logger.info(f"[{symbol}] ✅ Kalan pozisyon boyutu DB'ye kaydedildi: {remaining_size}")
                 
                 # Telegram'a kısmi kapatma bildirimi
                 partial_msg = (
@@ -333,8 +332,8 @@ class ExecutionEngine:
                 logger.error(f"[{symbol}] ⚠️ Atomik Cancel&Replace başarısız oldu! Eski stop emri ({old_stop_order_id}) hala devrede koruma sağlıyor. Hata: {edit_err}")
                 return False
 
-            # 4. Veritabanını güncelle (yeni stop fiyatı ve YENİ order ID ile)
-            await db.update_trade_stop(symbol, formatted_breakeven_stop, new_stop_order_id)
+            # 4. Veritabanını güncelle (yeni stop fiyatı, YENİ order ID ve TP durumu ile)
+            await db.update_trade_stop(symbol, formatted_breakeven_stop, new_stop_order_id, tp_taken=True)
             
             # 5. Telegram'a bildir
             alert_msg = (

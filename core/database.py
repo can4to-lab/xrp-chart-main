@@ -173,12 +173,25 @@ class Database:
         
         query = """
             UPDATE trades 
-            SET status = 'CLOSED', pnl = $1, close_price = $2, updated_at = CURRENT_TIMESTAMP
+            SET status = 'CLOSED', pnl = COALESCE(pnl, 0.0) + $1, close_price = $2, updated_at = CURRENT_TIMESTAMP
             WHERE symbol = $3 AND status = 'OPEN'
         """
         async with self.pool.acquire() as conn:
             await conn.execute(query, pnl, close_price, symbol)
             logger.debug(f"[{symbol}] 💾 İşlem veritabanında kapatıldı. (Fiyat: {close_price:.4f}, PnL: {pnl:.2f} USDT)")
+
+    async def update_trade_after_partial_close(self, symbol: str, pnl_delta: float, remaining_size: float):
+        """Kısmi kapatma sonrası kalan boyutu ve kümülatif PnL'yi günceller."""
+        if not self.pool: return
+
+        query = """
+            UPDATE trades
+            SET size = $1, pnl = COALESCE(pnl, 0.0) + $2, updated_at = CURRENT_TIMESTAMP
+            WHERE symbol = $3 AND status = 'OPEN'
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(query, remaining_size, pnl_delta, symbol)
+            logger.debug(f"[{symbol}] 💾 Kısmi kapatma sonrası kalan boyut ve PnL güncellendi. (Kalan: {remaining_size:.4f}, PnL delta: {pnl_delta:.2f})")
 
     async def get_open_trade(self, symbol: str) -> dict:
         """Belirli bir sembol için açık işlem olup olmadığını kontrol eder."""

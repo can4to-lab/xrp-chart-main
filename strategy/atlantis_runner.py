@@ -42,9 +42,13 @@ class TradeState:
         }
 
     def set_tp_taken(self, symbol: str):
-        """TP sinyali işlendiğinde bayrağı True yapar."""
+        """TP sinyali işlendiğinde bayrağı True yapar ve DB'ye yazar."""
         if symbol in self._state:
             self._state[symbol]['tp_taken'] = True
+        try:
+            asyncio.create_task(db.update_trade_stop(symbol, None, None, True))
+        except Exception as e:
+            logger.warning(f"[{symbol}] TP durumu DB'ye yazılamadı: {e}")
 
 
 class AtlantisStrategyRunner:
