@@ -457,6 +457,8 @@ class AtlantisIndicator:
         # Likidite avı sinyali varsa öncelik ver
         df.loc[df['liquidity_long_entry'] | df['liquidity_short_entry'], 'strategy_type'] = 'LIQUIDITY_SWEEP'
 
+        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        
         # ========== ÇIKIŞ SİNYALLERİ (Sadece Teknik Şartlar) ==========
         # LONG çıkışları
         df['long_exit_bb'] = df['close'] > df['bb_middle']
