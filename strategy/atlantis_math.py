@@ -457,18 +457,18 @@ class AtlantisIndicator:
         # Likidite avı sinyali varsa öncelik ver
         df.loc[df['liquidity_long_entry'] | df['liquidity_short_entry'], 'strategy_type'] = 'LIQUIDITY_SWEEP'
 
-        # ========== ÇIKIŞ SİNYALLERİ (Rejimden Bağımsız) ==========
-        
+        # ========== ÇIKIŞ SİNYALLERİ (Sadece Teknik Şartlar) ==========
+        # LONG çıkışları
         df['long_exit_bb'] = df['close'] > df['bb_middle']
         df['long_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] < 0)
-        # YENİ: Ayılar daha güçlü (di_minus > di_plus) VE fiyat EMA20'nin altında kapatmışsa çık!
-        df['long_exit_trend'] = (df['di_minus'] > df['di_plus']) & (df['close'] < df['ema_20'])
+        # DÜZELTME: Sütun isimleri minus_di ve plus_di olarak değiştirildi!
+        df['long_exit_trend'] = (df['minus_di'] > df['plus_di']) & (df['close'] < df['ema_20'])
         
         # SHORT çıkışları
         df['short_exit_bb'] = df['close'] < df['bb_middle']
         df['short_exit_squeeze'] = (~df['squeeze_on']) & (df['squeeze_on'].shift(1).fillna(False)) & (df['squeeze_momentum'] > 0)
-        # YENİ: Boğalar daha güçlü (di_plus > di_minus) VE fiyat EMA20'nin üstünde kapatmışsa çık!
-        df['short_exit_trend'] = (df['di_plus'] > df['di_minus']) & (df['close'] > df['ema_20'])
+        # DÜZELTME: Sütun isimleri plus_di ve minus_di olarak değiştirildi!
+        df['short_exit_trend'] = (df['plus_di'] > df['minus_di']) & (df['close'] > df['ema_20'])
 
         # Birleşik çıkış bayrakları: herhangi bir koşul tetiklenirse işlem kapatılır.
         df['long_exit'] = df['long_exit_bb'] | df['long_exit_squeeze'] | df['long_exit_trend']
