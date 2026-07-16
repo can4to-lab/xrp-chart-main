@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("Atlantis_Node")
 
 # Takip Edilecek Semboller
-TARGET_SYMBOLS = ["SOL/USDT", "AVAX/USDT", "ETH/USDT", "LINK/USDT"]
+TARGET_SYMBOLS = ["SOL/USDT", "BNB/USDT", "ETH/USDT"]
 
 # Global bileşenleri tanımla
 binance_client = None
