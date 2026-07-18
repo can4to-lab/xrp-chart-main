@@ -1,9 +1,12 @@
 import logging
 import asyncio
+from datetime import datetime
+from typing import Optional
 import pandas as pd
 from exchange.binance_async import BinanceFuturesClient
 from core.database import db
 from core.notifier import notifier
+from core.state import ExitReason, TradeClosedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +16,27 @@ class ExecutionEngine:
     def __init__(self, client: BinanceFuturesClient):
         self.client = client
         self.exchange = client.exchange
+        self._event_handlers = []
+
+    def register_event_handler(self, handler):
+        self._event_handlers.append(handler)
+
+    def _dispatch_trade_closed(self, event: TradeClosedEvent):
+        for handler in self._event_handlers:
+            try:
+                handler(event)
+            except Exception as exc:
+                logger.warning(f"Trade closed handler failed: {exc}")
+
+    def _normalize_reason(self, reason: ExitReason | str | None) -> ExitReason:
+        if isinstance(reason, ExitReason):
+            return reason
+        if isinstance(reason, str):
+            normalized = reason.upper().strip()
+            for candidate in ExitReason:
+                if candidate.value == normalized:
+                    return candidate
+        return ExitReason.SIGNAL
 
     def _to_ccxt_symbol(self, symbol: str) -> str:
         """'SOLUSDT' -> 'SOL/USDT' donusumu. CCXT bu formatta bekler."""
@@ -148,7 +172,7 @@ class ExecutionEngine:
             logger.error(f"[{symbol}] Islem hatasi: {str(e)}")
             return False
 
-    async def close_position(self, symbol: str, side: str, size: float, reason: str):
+    async def close_position(self, symbol: str, side: str, size: float, reason: ExitReason | str | None, snapshot: Optional[dict] = None):
         try:
             sym_ccxt = self._to_ccxt_symbol(symbol)
             # Once DB'den acik pozisyon bilgilerini alalim (PnL hesaplayabilmek icin)
@@ -245,18 +269,34 @@ class ExecutionEngine:
             
             # 5. Tam kapatma - DB'de kapat
             await db.close_trade(symbol, close_price=actual_close_price, pnl=pnl)
+
+            normalized_reason = self._normalize_reason(reason)
+            event = TradeClosedEvent(
+                symbol=symbol,
+                side=side,
+                reason=normalized_reason,
+                price=actual_close_price,
+                pnl=pnl,
+                timestamp=datetime.utcnow(),
+                adx=float(snapshot.get('adx', 0.0)) if snapshot else 0.0,
+                di_plus=float(snapshot.get('di_plus', 0.0)) if snapshot else 0.0,
+                di_minus=float(snapshot.get('di_minus', 0.0)) if snapshot else 0.0,
+                atr=float(snapshot.get('atr', 0.0)) if snapshot else 0.0,
+                regime=str(snapshot.get('regime', 'UNKNOWN')) if snapshot else 'UNKNOWN',
+            )
+            self._dispatch_trade_closed(event)
             
             # 6. Telegram'a Bildir
             pnl_icon = "🟢" if pnl >= 0 else "🔴"
             alert_msg = (
                 f"⚠️ <b>ISLEM KAPATILDI</b>\n\n"
                 f"📌 <b>Parite:</b> {symbol}\n"
-                f"ℹ️ <b>Sebep:</b> {reason}\n"
+                f"ℹ️ <b>Sebep:</b> {normalized_reason.value}\n"
                 f"💰 <b>Kapanis Fiyati:</b> {actual_close_price:.4f}\n"
                 f"{pnl_icon} <b>Net PnL:</b> {pnl:+.2f} USDT"
             )
             await notifier.send_message(alert_msg)
-            logger.info(f"[{symbol}] Kapatildi. Sebep: {reason}. Fiyat: {actual_close_price:.4f}, PnL: {pnl:.2f} USDT")
+            logger.info(f"[{symbol}] Kapatildi. Sebep: {normalized_reason.value}. Fiyat: {actual_close_price:.4f}, PnL: {pnl:.2f} USDT")
             
         except Exception as e:
             logger.error(f"[{symbol}] Kapatma hatasi: {str(e)}")

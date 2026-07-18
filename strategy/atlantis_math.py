@@ -252,17 +252,21 @@ class AtlantisIndicator:
         
         regime = pd.Series('UNKNOWN', index=df.index)
         
+        adx_series = adx_df['adx']
+        prev_adx = adx_series.shift(1)
+
         # Rejim 1: Yatay Piyasa
-        regime[adx_df['adx'] < self.adx_threshold_low] = 'RANGE'
+        regime[adx_series < self.adx_threshold_low] = 'RANGE'
         
         # Rejim 2: Sıkışma
         regime[squeeze_df['in_squeeze']] = 'SQUEEZE'
         
-        # Rejim 3: Trend
-        regime[adx_df['adx'] > self.adx_threshold_high] = 'TREND'
+        # Rejim 3: Trend (ADX yükseliyor ve yüksek eşik aşılıyor)
+        trend_condition = (adx_series > self.adx_threshold_high) & (adx_series > prev_adx)
+        regime[trend_condition] = 'TREND'
         
-        # Çakışma durumunda öncelik: Trend > Sıkışma > Yatay
-        regime = regime.replace('UNKNOWN', 'RANGE')  # Varsayılan
+        # Çakışma durumunda varsayılan olarak yatay piyasa
+        regime = regime.replace('UNKNOWN', 'RANGE')
         
         return pd.DataFrame({
             'regime': regime,
@@ -293,8 +297,11 @@ class AtlantisIndicator:
 
         # 2. Hacim Ortalaması ve Filtresi
         df['volume_ma'] = self.calculate_sma(df['volume'], self.volume_ma_period)
-        df['vol_sma'] = df['volume_ma']  # Runner'da kullanılan alias
-        df['volume_ok'] = df['volume'] > (df['volume_ma'] * self.volume_multiplier)
+        df['volume_ema'] = self.calculate_ema(df['volume'], self.volume_ma_period)
+        df['volume_std'] = df['volume'].rolling(window=self.volume_ma_period).std().fillna(0.0)
+        df['volume_zscore'] = ((df['volume'] - df['volume_ema']) / df['volume_std'].replace(0, np.nan)).fillna(0.0)
+        df['vol_sma'] = df['volume_ema']  # Runner'da kullanılan alias
+        df['volume_ok'] = df['volume_zscore'] > 0
 
         # 3. TBO (Geriye dönük uyumluluk - trend yönü için)
         df['fastTBO'] = self.calculate_ema(df['close'], self.fast_len)

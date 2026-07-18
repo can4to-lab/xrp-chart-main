@@ -6,49 +6,9 @@ from typing import List, Dict, Optional
 from strategy.atlantis_math import AtlantisIndicator
 from core.config import config
 from core.database import db  # Veritabanını beynimize bağladık
-from core.state import state  # Kilitler için ekledik
+from core.state import ExitReason, StopSnapshot, TradeClosedEvent, TradeState, state  # Kilitler için ekledik
 
 logger = logging.getLogger(__name__)
-
-
-class TradeState:
-    """Her sembol için işlem durumunu hafızada tutan sınıf."""
-
-    def __init__(self):
-        self._state: Dict[str, Dict] = {}
-
-    def get_state(self, symbol: str) -> Dict:
-        """Sembol için işlem durumunu döndürür, yoksa oluşturur."""
-        if symbol not in self._state:
-            self._state[symbol] = {
-                'in_position': False,
-                'side': None,
-                'entry_price': 0.0,
-                'size': 0.0,
-                'tp_taken': False,  # %50 kâr alındı bayrağı
-                'strategy_type': None,  # Kullanılan strateji türü
-            }
-        return self._state[symbol]
-
-    def reset_for_new_trade(self, symbol: str):
-        """Yeni işlem için durumu sıfırlar."""
-        self._state[symbol] = {
-            'in_position': False,
-            'side': None,
-            'entry_price': 0.0,
-            'size': 0.0,
-            'tp_taken': False,
-            'strategy_type': None,
-        }
-
-    def set_tp_taken(self, symbol: str):
-        """TP sinyali işlendiğinde bayrağı True yapar ve DB'ye yazar."""
-        if symbol in self._state:
-            self._state[symbol]['tp_taken'] = True
-        try:
-            asyncio.create_task(db.update_trade_stop(symbol, None, None, True))
-        except Exception as e:
-            logger.warning(f"[{symbol}] TP durumu DB'ye yazılamadı: {e}")
 
 
 class AtlantisStrategyRunner:
@@ -66,6 +26,8 @@ class AtlantisStrategyRunner:
         self._running = False
         self.indicator = AtlantisIndicator()
         self.trade_state = TradeState()  # Durum hafızası
+        if hasattr(self.execution_engine, 'register_event_handler'):
+            self.execution_engine.register_event_handler(self._handle_trade_closed)
         logger.info("🛠️ Atlantis İndikatör Matematiği ve Durum Hafızası belleğe yüklendi.")
 
     def _get_bool_signal(self, row, key: str, default: bool = False) -> bool:
@@ -83,6 +45,81 @@ class AtlantisStrategyRunner:
         except Exception:
             return default
         return default
+
+    def _get_last_stop_snapshot(self, symbol: str) -> Optional[StopSnapshot]:
+        state_dict = self.trade_state.get_state(symbol)
+        return state_dict.get('last_stop_snapshot')
+
+    def _calculate_whipsaw_score(self, row, symbol: str, exit_reason: ExitReason | None = None) -> float:
+        """Stop sonrası yeni sinyalin "testere" riskini azaltmak için bir skor üretir."""
+        if exit_reason != ExitReason.STOP:
+            return 0.0
+
+        snapshot = self._get_last_stop_snapshot(symbol)
+        if snapshot is None:
+            return 0.0
+
+        price = self._get_numeric_signal(row, 'close', 0.0)
+        adx = self._get_numeric_signal(row, 'adx', 0.0)
+        regime = str(row.get('regime', '')) if isinstance(row, dict) else str(row['regime']) if 'regime' in row.index else ''
+        volume = self._get_numeric_signal(row, 'volume', 0.0)
+        vol_sma = self._get_numeric_signal(row, 'vol_sma', 0.0)
+        atr = self._get_numeric_signal(row, 'atr', 0.0)
+
+        same_side = 1 if snapshot.side.upper() == 'LONG' and price > snapshot.price else 0
+        same_side = same_side if same_side else (1 if snapshot.side.upper() == 'SHORT' and price < snapshot.price else 0)
+        same_regime = 1 if str(snapshot.regime).upper() == str(regime).upper() else 0
+        adx_score = 1 if adx >= 25 and adx >= snapshot.adx else 0
+        price_score = 1 if abs(price - snapshot.price) < max(snapshot.atr, atr) else 0
+        volume_score = 1 if vol_sma > 0 and volume < vol_sma else 0
+
+        total_score = (
+            (same_side * config.WEIGHT_SAME_SIDE) +
+            (same_regime * config.WEIGHT_SAME_REGIME) +
+            (adx_score * config.WEIGHT_ADX) +
+            (price_score * config.WEIGHT_PRICE) +
+            (volume_score * config.WEIGHT_VOLUME)
+        )
+        return float(total_score)
+
+    def _should_reject_signal(self, row, symbol: str, exit_reason: ExitReason | None = None) -> bool:
+        score = self._calculate_whipsaw_score(row, symbol, exit_reason=exit_reason)
+        if score >= config.WHIPSAW_SCORE_THRESHOLD:
+            logger.warning(f"[{symbol}] ⚠️ Whipsaw score {score} nedeniyle sinyal reddedildi.")
+            return True
+        return False
+
+    def _handle_trade_closed(self, event: TradeClosedEvent):
+        state_dict = self.trade_state.get_state(event.symbol)
+        state_dict['last_exit_reason'] = event.reason
+        if event.reason == ExitReason.STOP:
+            snapshot = StopSnapshot(
+                time=event.timestamp or pd.Timestamp.utcnow().to_pydatetime(),
+                side=event.side,
+                price=event.price,
+                adx=event.adx,
+                di_plus=event.di_plus,
+                di_minus=event.di_minus,
+                atr=event.atr,
+                regime=event.regime,
+            )
+            state_dict['last_stop_snapshot'] = snapshot
+
+    async def _record_stop_snapshot(self, symbol: str, row, side: str):
+        if not isinstance(row, pd.Series):
+            return
+        snapshot = StopSnapshot(
+            time=pd.Timestamp.utcnow().to_pydatetime(),
+            side=side,
+            price=float(row.get('close', 0.0)) if isinstance(row, pd.Series) else 0.0,
+            adx=float(row.get('adx', 0.0)) if isinstance(row, pd.Series) else 0.0,
+            di_plus=float(row.get('plus_di', 0.0)) if isinstance(row, pd.Series) else 0.0,
+            di_minus=float(row.get('minus_di', 0.0)) if isinstance(row, pd.Series) else 0.0,
+            atr=float(row.get('atr', 0.0)) if isinstance(row, pd.Series) else 0.0,
+            regime=str(row.get('regime', 'UNKNOWN')) if isinstance(row, pd.Series) else 'UNKNOWN',
+        )
+        state_dict = self.trade_state.get_state(symbol)
+        state_dict['last_stop_snapshot'] = snapshot
 
     def _get_numeric_signal(self, row, key: str, default: float = 0.0) -> float:
         """Eksik sütunlarda hata vermeden güvenli numeric sinyali döndürür."""
@@ -260,27 +297,34 @@ class AtlantisStrategyRunner:
                         
                         if current_state['side'] == 'LONG':
                             if strat_type == 'MEAN_REVERSION' and bool(last_closed_candle.get('long_exit_bb', False)):
-                                exit_reason = "LONG EXIT (Bollinger Orta Bandı)"
+                                exit_reason = ExitReason.SIGNAL
                             elif strat_type == 'SQUEEZE' and bool(last_closed_candle.get('long_exit_squeeze', False)):
-                                exit_reason = "LONG EXIT (Squeeze Bitti)"
+                                exit_reason = ExitReason.SIGNAL
                             elif strat_type == 'TREND' and bool(last_closed_candle.get('long_exit_trend', False)):
-                                exit_reason = "LONG EXIT (DI Kesişimi)"
+                                exit_reason = ExitReason.SIGNAL
                                 
                         elif current_state['side'] == 'SHORT':
                             if strat_type == 'MEAN_REVERSION' and bool(last_closed_candle.get('short_exit_bb', False)):
-                                exit_reason = "SHORT EXIT (Bollinger Orta Bandı)"
+                                exit_reason = ExitReason.SIGNAL
                             elif strat_type == 'SQUEEZE' and bool(last_closed_candle.get('short_exit_squeeze', False)):
-                                exit_reason = "SHORT EXIT (Squeeze Bitti)"
+                                exit_reason = ExitReason.SIGNAL
                             elif strat_type == 'TREND' and bool(last_closed_candle.get('short_exit_trend', False)):
-                                exit_reason = "SHORT EXIT (DI Kesişimi)"
+                                exit_reason = ExitReason.SIGNAL
                         
                         if exit_reason:
-                            logger.warning(f"[{sym_key}] ⚠️ {exit_reason}! Kalan pozisyon kapatılıyor...")
+                            logger.warning(f"[{sym_key}] ⚠️ Sinyal nedeniyle pozisyon kapatılıyor...")
                             await self.execution_engine.close_position(
-                                symbol=sym_key, 
-                                side=current_state['side'], 
-                                size=current_state['size'], 
-                                reason=exit_reason
+                                symbol=sym_key,
+                                side=current_state['side'],
+                                size=current_state['size'],
+                                reason=ExitReason.SIGNAL,
+                                snapshot={
+                                    'adx': adx_val,
+                                    'di_plus': self._get_numeric_signal(last_candle, 'plus_di', 0.0),
+                                    'di_minus': self._get_numeric_signal(last_candle, 'minus_di', 0.0),
+                                    'atr': atr_stop_dist,
+                                    'regime': regime,
+                                }
                             )
                             self.trade_state.reset_for_new_trade(sym_key)
                             await asyncio.sleep(10)
@@ -300,7 +344,14 @@ class AtlantisStrategyRunner:
                                 logger.warning(f"[{sym_key}] 💰 LONG TP VAKTİ! (Kâr: %{unrealized_roe:.2f}). %50 pozisyon kapatılıyor...")
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_key, side='LONG', size=half_size, reason="LONG TP (Kâr Realizasyonu)"
+                                    symbol=sym_key, side='LONG', size=half_size, reason=ExitReason.TP,
+                                    snapshot={
+                                        'adx': adx_val,
+                                        'di_plus': self._get_numeric_signal(last_candle, 'plus_di', 0.0),
+                                        'di_minus': self._get_numeric_signal(last_candle, 'minus_di', 0.0),
+                                        'atr': atr_stop_dist,
+                                        'regime': regime,
+                                    }
                                 )
                                 await self.execution_engine.move_stop_to_breakeven(
                                     symbol=sym_key, side='LONG', entry_price=current_state['entry_price']
@@ -314,7 +365,14 @@ class AtlantisStrategyRunner:
                                 logger.warning(f"[{sym_key}] 💰 SHORT TP VAKTİ! (Kâr: %{unrealized_roe:.2f}). %50 pozisyon kapatılıyor...")
                                 half_size = current_state['size'] / 2
                                 await self.execution_engine.close_position(
-                                    symbol=sym_key, side='SHORT', size=half_size, reason="SHORT TP (Kâr Realizasyonu)"
+                                    symbol=sym_key, side='SHORT', size=half_size, reason=ExitReason.TP,
+                                    snapshot={
+                                        'adx': adx_val,
+                                        'di_plus': self._get_numeric_signal(last_candle, 'plus_di', 0.0),
+                                        'di_minus': self._get_numeric_signal(last_candle, 'minus_di', 0.0),
+                                        'atr': atr_stop_dist,
+                                        'regime': regime,
+                                    }
                                 )
                                 await self.execution_engine.move_stop_to_breakeven(
                                     symbol=sym_key, side='SHORT', entry_price=current_state['entry_price']
@@ -330,6 +388,10 @@ class AtlantisStrategyRunner:
 
                     # --- 3. FIRSAT ARA (GİRİŞ SİNYALİ KONTROLÜ) ---
                     if long_signal:
+                        if self._should_reject_signal(last_candle, sym_key, ExitReason.STOP if current_state.get('last_exit_reason') == ExitReason.STOP else None):
+                            await asyncio.sleep(3)
+                            continue
+
                         strateji_adi = strategy_type if strategy_type != 'NONE' else 'UNKNOWN'
                         logger.info(f"[{sym_key}] 🚀 GÜÇLÜ LONG SİNYALİ! ({regime} | {strategy_type}) İşleme giriliyor...")
                         margin_usdt = await self.risk_manager.calculate_margin(sym_key)
@@ -342,13 +404,11 @@ class AtlantisStrategyRunner:
                                 strategy_type=strategy_type
                             )
                             if success:
-                                # State'i güncelle
                                 current_state['in_position'] = True
                                 current_state['side'] = 'LONG'
                                 current_state['entry_price'] = current_price
                                 current_state['strategy_type'] = strategy_type
-                                # Gerçek boyutu DB'den çek (senkronizasyon)
-                                await asyncio.sleep(0.5)  # DB kaydının tamamlanması için kısa bekle
+                                await asyncio.sleep(0.5)
                                 updated_trade = await db.get_open_trade(sym_key)
                                 if updated_trade:
                                     current_state['size'] = updated_trade['size']
@@ -356,6 +416,10 @@ class AtlantisStrategyRunner:
                             await asyncio.sleep(10)
                             
                     elif short_signal:
+                        if self._should_reject_signal(last_candle, sym_key, ExitReason.STOP if current_state.get('last_exit_reason') == ExitReason.STOP else None):
+                            await asyncio.sleep(3)
+                            continue
+
                         strateji_adi = strategy_type if strategy_type != 'NONE' else 'UNKNOWN'
                         logger.info(f"[{sym_key}] 🩸 GÜÇLÜ SHORT SİNYALİ! ({regime} | {strategy_type}) İşleme giriliyor...")
                         margin_usdt = await self.risk_manager.calculate_margin(sym_key)
@@ -368,13 +432,11 @@ class AtlantisStrategyRunner:
                                 strategy_type=strategy_type
                             )
                             if success:
-                                # State'i güncelle
                                 current_state['in_position'] = True
                                 current_state['side'] = 'SHORT'
                                 current_state['entry_price'] = current_price
                                 current_state['strategy_type'] = strategy_type
-                                # Gerçek boyutu DB'den çek (senkronizasyon)
-                                await asyncio.sleep(0.5)  # DB kaydının tamamlanması için kısa bekle
+                                await asyncio.sleep(0.5)
                                 updated_trade = await db.get_open_trade(sym_key)
                                 if updated_trade:
                                     current_state['size'] = updated_trade['size']
