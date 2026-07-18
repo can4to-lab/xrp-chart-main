@@ -45,7 +45,7 @@ class Database:
                     return
 
     async def _create_tables(self):
-        """İşlemlerin tutulacağı 'trades' tablosunu oluşturur (Yoksa yaratır)."""
+        """İşlemlerin tutulacağı 'trades' ve 'trade_diagnostics' tablolarını oluşturur (Yoksa yaratır)."""
         query_table = """
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -70,6 +70,22 @@ class Database:
         if self.pool:
             async with self.pool.acquire() as conn:
                 await conn.execute(query_table)
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS trade_diagnostics (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    side VARCHAR(10) NOT NULL,
+                    pnl FLOAT NOT NULL DEFAULT 0.0,
+                    reason VARCHAR(50) NOT NULL DEFAULT 'UNKNOWN',
+                    adx FLOAT DEFAULT 0.0,
+                    regime VARCHAR(30) DEFAULT 'UNKNOWN',
+                    volume FLOAT DEFAULT 0.0,
+                    vol_sma FLOAT DEFAULT 0.0,
+                    atr FLOAT DEFAULT 0.0,
+                    btc_trend VARCHAR(30) DEFAULT 'UNKNOWN',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
                 await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_taken BOOLEAN NOT NULL DEFAULT FALSE;")
                 await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(50) NOT NULL DEFAULT 'UNKNOWN';")
                 try:
@@ -166,6 +182,20 @@ class Database:
             trade_id = await conn.fetchval(query, symbol, side, leverage, size, entry_price, stop_price, strategy_type)
             logger.debug(f"[{symbol}] 💾 Yeni işlem veritabanına kaydedildi. (ID: {trade_id}, strategy_type={strategy_type})")
             return trade_id
+
+    async def insert_trade_diagnostic(self, symbol: str, side: str, pnl: float, reason: str, adx: float, regime: str, volume: float, vol_sma: float, atr: float, btc_trend: str):
+        """Zarar/stop analitiği kayıtlarını trade_diagnostics tablosuna yazar."""
+        if not self.pool:
+            return None
+
+        query = """
+            INSERT INTO trade_diagnostics (symbol, side, pnl, reason, adx, regime, volume, vol_sma, atr, btc_trend)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id
+        """
+        async with self.pool.acquire() as conn:
+            diagnostic_id = await conn.fetchval(query, symbol, side, pnl, reason, adx, regime, volume, vol_sma, atr, btc_trend)
+            logger.debug(f"[{symbol}] 💾 Trade diagnostic kaydı veritabanına yazıldı. (ID: {diagnostic_id})")
+            return diagnostic_id
 
     async def close_trade(self, symbol: str, close_price: float, pnl: float):
         """Açık olan işlemi bulur, 'CLOSED' olarak işaretler ve Kâr/Zarar (PnL) ile kapanış fiyatını yazar."""

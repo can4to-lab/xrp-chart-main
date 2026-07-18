@@ -26,12 +26,4 @@ class Config:
     LEVERAGE = 10                 # Varsayılan kaldıraç
     TRADE_SIZE_USDT = 20.0        # İşlem başına kullanılacak marjin (Dolar)
 
-    # Whipsaw skorlama ağırlıkları
-    WEIGHT_SAME_SIDE = 2
-    WEIGHT_SAME_REGIME = 2
-    WEIGHT_ADX = 2
-    WEIGHT_PRICE = 2
-    WEIGHT_VOLUME = 1
-    WHIPSAW_SCORE_THRESHOLD = 7
-
 config = Config()

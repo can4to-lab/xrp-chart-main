@@ -42,6 +42,9 @@ class TradeClosedEvent:
     di_minus: float = 0.0
     atr: float = 0.0
     regime: str = "UNKNOWN"
+    volume: float = 0.0
+    vol_sma: float = 0.0
+    btc_trend: str = "UNKNOWN"
 
     def __post_init__(self):
         if self.timestamp is None:

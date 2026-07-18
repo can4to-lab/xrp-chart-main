@@ -283,6 +283,9 @@ class ExecutionEngine:
                 di_minus=float(snapshot.get('di_minus', 0.0)) if snapshot else 0.0,
                 atr=float(snapshot.get('atr', 0.0)) if snapshot else 0.0,
                 regime=str(snapshot.get('regime', 'UNKNOWN')) if snapshot else 'UNKNOWN',
+                volume=float(snapshot.get('volume', 0.0)) if snapshot else 0.0,
+                vol_sma=float(snapshot.get('vol_sma', 0.0)) if snapshot else 0.0,
+                btc_trend=str(snapshot.get('btc_trend', 'UNKNOWN')) if snapshot else 'UNKNOWN',
             )
             self._dispatch_trade_closed(event)
             

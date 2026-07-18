@@ -13,6 +13,7 @@ from strategy.atlantis_runner import AtlantisStrategyRunner
 from execution.risk_manager import RiskManager
 from core.database import db
 from core.notifier import notifier
+from core.diagnostics import diagnostics_store
 
 # Loglama Konfigürasyonu
 logging.basicConfig(
@@ -246,6 +247,12 @@ async def get_open_trades():
         trades = [dict(record) for record in records]
 
     return {"open_trades_count": len(trades), "trades": trades}
+
+
+@app.get("/trade-diagnostics")
+async def get_trade_diagnostics():
+    """Son işlemlerden elde edilen zarar analitiğini döndürür."""
+    return diagnostics_store.summarize_losses()
 
 
 @app.get("/status")
